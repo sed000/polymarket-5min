@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+trades.db
+bun.lockb
+<<<<<<< HEAD
+.env.example
+=======
+>>>>>>> 1c70e22 (initial)
