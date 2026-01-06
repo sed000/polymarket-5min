@@ -76,13 +76,23 @@ export class Bot {
     }
 
     // Connect WebSocket for real-time prices (market channel is public, no auth needed)
+    // Set up connection state tracking
+    this.priceStream.onConnectionChange((connected) => {
+      this.state.wsConnected = connected;
+      if (connected) {
+        this.log("WebSocket reconnected");
+      } else {
+        this.log("WebSocket disconnected, will reconnect...");
+      }
+    });
+
     try {
       await this.priceStream.connect();
       this.state.wsConnected = true;
       this.log("WebSocket connected for real-time prices");
 
       if (this.state.markets.length > 0) {
-        this.subscribeToMarkets(this.state.markets);
+        await this.subscribeToMarkets(this.state.markets);
       }
     } catch (err) {
       this.log("WebSocket connection failed, using Gamma API");
@@ -194,7 +204,7 @@ export class Bot {
     this.onLog(formatted);
   }
 
-  private subscribeToMarkets(markets: Market[]): void {
+  private async subscribeToMarkets(markets: Market[]): Promise<void> {
     const tokenIds: string[] = [];
     for (const market of markets) {
       if (market.clobTokenIds) {
@@ -203,6 +213,14 @@ export class Bot {
     }
     if (tokenIds.length > 0) {
       this.priceStream.subscribe(tokenIds);
+
+      // Log subscription status
+      if (!this.priceStream.isConnected()) {
+        this.log(`Warning: WebSocket not connected, prices may be delayed`);
+      } else {
+        // Give WebSocket a moment to receive initial book snapshots
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
     }
   }
 
@@ -362,7 +380,7 @@ export class Bot {
     try {
       // Refresh markets list
       this.state.markets = await fetchBtc15MinMarkets();
-      this.subscribeToMarkets(this.state.markets);
+      await this.subscribeToMarkets(this.state.markets);
 
       // Use WebSocket prices if available for more accurate signals
       const priceOverrides = this.getPriceOverrides();
@@ -478,7 +496,7 @@ export class Bot {
   async getMarketOverview(): Promise<EligibleMarket[]> {
     // Always fetch fresh market data for accurate prices
     this.state.markets = await fetchBtc15MinMarkets();
-    this.subscribeToMarkets(this.state.markets);
+    await this.subscribeToMarkets(this.state.markets);
 
     // Use WebSocket prices if available for more accurate display
     const priceOverrides = this.getPriceOverrides();

@@ -10,12 +10,14 @@ export interface PriceUpdate {
 }
 
 type PriceCallback = (update: PriceUpdate) => void;
+type ConnectionCallback = (connected: boolean) => void;
 
 export class PriceStream {
   private ws: WebSocket | null = null;
   private subscriptions: Set<string> = new Set();
   private prices: Map<string, PriceUpdate> = new Map();
   private callbacks: PriceCallback[] = [];
+  private connectionCallbacks: ConnectionCallback[] = [];
   private reconnectTimer: Timer | null = null;
   private pingTimer: Timer | null = null;
   private connected = false;
@@ -34,6 +36,7 @@ export class PriceStream {
         this.ws.onopen = () => {
           clearTimeout(timeout);
           this.connected = true;
+          this.notifyConnectionChange(true);
 
           // Market channel does NOT require authentication (only user channel does)
           // Just start pinging and subscribe to markets
@@ -71,6 +74,7 @@ export class PriceStream {
 
         this.ws.onclose = () => {
           this.connected = false;
+          this.notifyConnectionChange(false);
           if (this.pingTimer) {
             clearInterval(this.pingTimer);
             this.pingTimer = null;
@@ -224,6 +228,16 @@ export class PriceStream {
     }
   }
 
+  private notifyConnectionChange(connected: boolean) {
+    for (const cb of this.connectionCallbacks) {
+      try {
+        cb(connected);
+      } catch {
+        // Ignore callback errors
+      }
+    }
+  }
+
   private sendSubscription(tokenIds: string[]) {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
 
@@ -235,12 +249,16 @@ export class PriceStream {
   }
 
   subscribe(tokenIds: string[]) {
-    for (const id of tokenIds) {
+    // Filter to only new token IDs we haven't subscribed to yet
+    const newTokenIds = tokenIds.filter(id => !this.subscriptions.has(id));
+
+    for (const id of newTokenIds) {
       this.subscriptions.add(id);
     }
 
-    if (this.connected && this.ws?.readyState === WebSocket.OPEN) {
-      this.sendSubscription(tokenIds);
+    // Only send subscription if we have new tokens
+    if (newTokenIds.length > 0 && this.connected && this.ws?.readyState === WebSocket.OPEN) {
+      this.sendSubscription(newTokenIds);
     }
   }
 
@@ -248,12 +266,24 @@ export class PriceStream {
     this.callbacks.push(callback);
   }
 
+  onConnectionChange(callback: ConnectionCallback) {
+    this.connectionCallbacks.push(callback);
+  }
+
   getPrice(tokenId: string): PriceUpdate | null {
     return this.prices.get(tokenId) || null;
   }
 
   isConnected(): boolean {
-    return this.connected;
+    return this.connected && this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  getSubscriptionCount(): number {
+    return this.subscriptions.size;
+  }
+
+  getPriceCount(): number {
+    return this.prices.size;
   }
 
   close() {
