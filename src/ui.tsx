@@ -10,14 +10,19 @@ interface AppProps {
 
 function Header({ state, config }: { state: BotState; config: BotConfig }) {
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="cyan" paddingX={1}>
+    <Box flexDirection="column" borderStyle="single" borderColor={state.paperTrading ? "yellow" : "cyan"} paddingX={1}>
       <Box justifyContent="space-between">
-        <Text bold color="cyan">POLYMARKET BTC 15-MIN BOT</Text>
+        <Text bold color={state.paperTrading ? "yellow" : "cyan"}>
+          POLYMARKET BTC 15-MIN BOT {state.paperTrading && "[PAPER]"}
+        </Text>
         <Box gap={2}>
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
           </Text>
-          {!state.tradingEnabled && (
+          {state.paperTrading && (
+            <Text color="yellow" bold>PAPER</Text>
+          )}
+          {!state.tradingEnabled && !state.paperTrading && (
             <Text color="yellow">WATCH</Text>
           )}
           <Text color={state.running ? "green" : "red"}>

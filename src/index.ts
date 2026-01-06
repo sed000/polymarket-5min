@@ -1,11 +1,15 @@
 import { Bot, type BotConfig } from "./bot";
 import { renderUI } from "./ui";
 
+const paperTrading = process.env.PAPER_TRADING === "true";
+
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-if (!PRIVATE_KEY) {
-  console.error("Error: PRIVATE_KEY environment variable is required");
+if (!PRIVATE_KEY && !paperTrading) {
+  console.error("Error: PRIVATE_KEY environment variable is required for real trading");
   console.error("Create a .env file with your wallet private key:");
   console.error("  PRIVATE_KEY=0x...");
+  console.error("\nOr enable paper trading mode:");
+  console.error("  PAPER_TRADING=true");
   process.exit(1);
 }
 
@@ -13,13 +17,18 @@ const config: BotConfig = {
   entryThreshold: parseFloat(process.env.ENTRY_THRESHOLD || "0.95"),
   stopLoss: parseFloat(process.env.STOP_LOSS || "0.85"),
   timeWindowMs: parseInt(process.env.TIME_WINDOW_MINS || "5") * 60 * 1000,
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000")
+  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000"),
+  paperTrading,
+  paperBalance: parseFloat(process.env.PAPER_BALANCE || "100")
 };
 
 async function main() {
   console.log("Initializing Polymarket BTC Bot...\n");
 
-  const bot = new Bot(PRIVATE_KEY, config, () => {
+  // In paper trading mode, PRIVATE_KEY is optional
+  const privateKey = PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+  const bot = new Bot(privateKey, config, () => {
     // Logs are handled by UI
   });
 

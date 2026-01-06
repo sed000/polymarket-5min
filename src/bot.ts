@@ -8,18 +8,31 @@ export interface BotConfig {
   stopLoss: number;        // e.g., 0.85
   timeWindowMs: number;    // e.g., 5 * 60 * 1000
   pollIntervalMs: number;  // e.g., 10 * 1000
+  paperTrading: boolean;   // Simulate trades with virtual money
+  paperBalance: number;    // Starting balance for paper trading
+}
+
+export interface Position {
+  tradeId: number;
+  tokenId: string;
+  shares: number;
+  entryPrice: number;
+  side: "UP" | "DOWN";
+  marketSlug: string;
+  marketEndDate: Date;
 }
 
 export interface BotState {
   running: boolean;
   balance: number;
-  positions: Map<string, { tradeId: number; tokenId: string; shares: number; entryPrice: number; side: "UP" | "DOWN"; marketSlug: string }>;
+  positions: Map<string, Position>;
   lastScan: Date | null;
   logs: string[];
   tradingEnabled: boolean;
   initError: string | null;
   wsConnected: boolean;
   markets: Market[];
+  paperTrading: boolean;
 }
 
 export type LogCallback = (message: string) => void;
@@ -39,14 +52,15 @@ export class Bot {
     this.priceStream = getPriceStream();
     this.state = {
       running: false,
-      balance: 0,
+      balance: config.paperTrading ? config.paperBalance : 0,
       positions: new Map(),
       lastScan: null,
       logs: [],
       tradingEnabled: false,
       initError: null,
       wsConnected: false,
-      markets: []
+      markets: [],
+      paperTrading: config.paperTrading
     };
   }
 
@@ -61,12 +75,6 @@ export class Bot {
       this.log("Failed to fetch markets");
     }
 
-    // Initialize trader
-    await this.trader.init();
-
-    const walletAddr = this.trader.getAddress();
-    this.log(`Wallet: ${walletAddr.slice(0, 10)}...${walletAddr.slice(-8)}`);
-
     // Connect WebSocket for real-time prices (market channel is public, no auth needed)
     try {
       await this.priceStream.connect();
@@ -80,30 +88,99 @@ export class Bot {
       this.log("WebSocket connection failed, using Gamma API");
     }
 
-    if (this.trader.isReady()) {
+    // Paper trading mode - skip real trader init
+    if (this.config.paperTrading) {
+      this.log("PAPER TRADING MODE - Using virtual money");
       this.state.tradingEnabled = true;
-      this.state.balance = await this.trader.getBalance();
-      this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
 
-      // Load open trades from DB
+      // Load open paper trades from DB
       const openTrades = getOpenTrades();
       for (const trade of openTrades) {
+        // Try to parse end date from slug if not stored (btc-updown-15m-TIMESTAMP)
+        let marketEndDate: Date;
+        if (trade.market_end_date) {
+          marketEndDate = new Date(trade.market_end_date);
+        } else {
+          // Parse timestamp from slug and add 15 minutes
+          const match = trade.market_slug.match(/btc-updown-15m-(\d+)/);
+          if (match) {
+            const startTimestamp = parseInt(match[1]) * 1000;
+            marketEndDate = new Date(startTimestamp + 15 * 60 * 1000);
+          } else {
+            marketEndDate = new Date(0);
+          }
+        }
+
         this.state.positions.set(trade.token_id, {
           tradeId: trade.id,
           tokenId: trade.token_id,
           shares: trade.shares,
           entryPrice: trade.entry_price,
           side: trade.side as "UP" | "DOWN",
-          marketSlug: trade.market_slug
+          marketSlug: trade.market_slug,
+          marketEndDate
         });
       }
       if (openTrades.length > 0) {
+        // Money is invested in positions, so available balance is 0
+        this.state.balance = 0;
         this.log(`Loaded ${openTrades.length} open positions`);
+        // Check for any expired positions immediately
+        await this.checkExpiredPositions();
       }
+
+      // Log final balance after processing
+      this.log(`Available balance: $${this.state.balance.toFixed(2)}`);
     } else {
-      this.state.initError = this.trader.getInitError();
-      this.log(`Trading disabled: ${this.state.initError}`);
-      this.log("Tip: Ensure API keys match your wallet");
+      // Initialize trader for real trading
+      await this.trader.init();
+
+      const walletAddr = this.trader.getAddress();
+      this.log(`Wallet: ${walletAddr.slice(0, 10)}...${walletAddr.slice(-8)}`);
+
+      if (this.trader.isReady()) {
+        this.state.tradingEnabled = true;
+        this.state.balance = await this.trader.getBalance();
+        this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
+
+        // Load open trades from DB
+        const openTrades = getOpenTrades();
+        for (const trade of openTrades) {
+          // Try to parse end date from slug if not stored (btc-updown-15m-TIMESTAMP)
+          let marketEndDate: Date;
+          if (trade.market_end_date) {
+            marketEndDate = new Date(trade.market_end_date);
+          } else {
+            // Parse timestamp from slug and add 15 minutes
+            const match = trade.market_slug.match(/btc-updown-15m-(\d+)/);
+            if (match) {
+              const startTimestamp = parseInt(match[1]) * 1000;
+              marketEndDate = new Date(startTimestamp + 15 * 60 * 1000);
+            } else {
+              marketEndDate = new Date(0);
+            }
+          }
+
+          this.state.positions.set(trade.token_id, {
+            tradeId: trade.id,
+            tokenId: trade.token_id,
+            shares: trade.shares,
+            entryPrice: trade.entry_price,
+            side: trade.side as "UP" | "DOWN",
+            marketSlug: trade.market_slug,
+            marketEndDate
+          });
+        }
+        if (openTrades.length > 0) {
+          this.log(`Loaded ${openTrades.length} open positions`);
+          // Check for any expired positions immediately
+          await this.checkExpiredPositions();
+        }
+      } else {
+        this.state.initError = this.trader.getInitError();
+        this.log(`Trading disabled: ${this.state.initError}`);
+        this.log("Tip: Ensure API keys match your wallet");
+      }
     }
   }
 
@@ -173,12 +250,18 @@ export class Bot {
     try {
       this.state.lastScan = new Date();
 
-      // Only trade if CLOB client is ready
+      // Only trade if trading is enabled
       if (!this.state.tradingEnabled) {
         return;
       }
 
-      this.state.balance = await this.trader.getBalance();
+      // In paper mode, balance is managed internally
+      if (!this.config.paperTrading) {
+        this.state.balance = await this.trader.getBalance();
+      }
+
+      // Check for expired markets first (close at $0.99)
+      await this.checkExpiredPositions();
 
       // Check stop-losses on open positions
       await this.checkStopLosses();
@@ -192,29 +275,81 @@ export class Bot {
     }
   }
 
+  private async checkExpiredPositions(): Promise<void> {
+    const now = new Date();
+
+    for (const [tokenId, position] of this.state.positions) {
+      // Check if market has ended
+      if (position.marketEndDate.getTime() > 0 && now >= position.marketEndDate) {
+        this.log(`Market expired for ${position.side} position`);
+
+        // Exit at $0.99 (assuming win since we entered at >= $0.95 confidence)
+        const exitPrice = 0.99;
+        const proceeds = exitPrice * position.shares;
+        const pnl = (exitPrice - position.entryPrice) * position.shares;
+
+        if (this.config.paperTrading) {
+          // Paper trading: add proceeds to balance
+          closeTrade(position.tradeId, exitPrice, "RESOLVED");
+          this.state.positions.delete(tokenId);
+          this.state.balance += proceeds;
+          this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+          this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
+        } else {
+          // Real trading: market sell
+          try {
+            const result = await this.trader.marketSell(tokenId, position.shares);
+            if (result) {
+              closeTrade(position.tradeId, result.price, "RESOLVED");
+              this.state.positions.delete(tokenId);
+              const realPnl = (result.price - position.entryPrice) * position.shares;
+              this.log(`Market resolved. PnL: $${realPnl.toFixed(2)}`);
+            }
+          } catch (err) {
+            this.log(`Error selling expired position: ${err}`);
+          }
+        }
+      }
+    }
+  }
+
   private async checkStopLosses(): Promise<void> {
     for (const [tokenId, position] of this.state.positions) {
       try {
         // Use WebSocket price if available, otherwise fall back to REST API
-        let currentPrice: number;
+        let currentBid: number;
         const wsPrice = this.priceStream.getPrice(tokenId);
         if (wsPrice && this.state.wsConnected) {
-          currentPrice = wsPrice.price;
+          currentBid = wsPrice.bestBid;
+        } else if (!this.config.paperTrading) {
+          const { bid } = await this.trader.getPrice(tokenId);
+          currentBid = bid;
         } else {
-          const { mid } = await this.trader.getPrice(tokenId);
-          currentPrice = mid;
+          continue; // Skip if no price available in paper mode
         }
 
-        // Check if stop-loss triggered (price dropped to 85% or below)
-        if (currentPrice <= this.config.stopLoss) {
-          this.log(`Stop-loss triggered for ${position.side} @ $${currentPrice.toFixed(2)}`);
+        // Check if stop-loss triggered (price dropped to stop-loss level)
+        if (currentBid <= this.config.stopLoss) {
+          this.log(`Stop-loss triggered for ${position.side} @ $${currentBid.toFixed(2)}`);
 
-          const result = await this.trader.marketSell(tokenId, position.shares);
-          if (result) {
-            closeTrade(position.tradeId, result.price, "STOPPED");
+          if (this.config.paperTrading) {
+            // Paper trading: simulate sell at bid price
+            const exitPrice = currentBid;
+            const proceeds = exitPrice * position.shares;
+            closeTrade(position.tradeId, exitPrice, "STOPPED");
             this.state.positions.delete(tokenId);
-            const pnl = (result.price - position.entryPrice) * position.shares;
-            this.log(`Closed position. PnL: $${pnl.toFixed(2)}`);
+            this.state.balance += proceeds;
+            const pnl = (exitPrice - position.entryPrice) * position.shares;
+            this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+          } else {
+            // Real trading
+            const result = await this.trader.marketSell(tokenId, position.shares);
+            if (result) {
+              closeTrade(position.tradeId, result.price, "STOPPED");
+              this.state.positions.delete(tokenId);
+              const pnl = (result.price - position.entryPrice) * position.shares;
+              this.log(`Closed position. PnL: $${pnl.toFixed(2)}`);
+            }
           }
         }
       } catch (err) {
@@ -255,40 +390,81 @@ export class Bot {
 
     this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
-    // Use full balance
-    const balance = await this.trader.getBalance();
-    if (balance < 1) {
-      this.log("Insufficient balance");
-      return;
+    if (this.config.paperTrading) {
+      // Paper trading: simulate buy at ask price
+      const balance = this.state.balance;
+      if (balance < 1) {
+        this.log("Insufficient paper balance");
+        return;
+      }
+
+      // Calculate shares: balance / askPrice
+      const shares = balance / askPrice;
+
+      // Record paper trade
+      const tradeId = insertTrade({
+        market_slug: market.slug,
+        token_id: tokenId,
+        side,
+        entry_price: askPrice,
+        shares,
+        cost_basis: balance,
+        created_at: new Date().toISOString(),
+        market_end_date: market.endDate.toISOString()
+      });
+
+      this.state.positions.set(tokenId, {
+        tradeId,
+        tokenId,
+        shares,
+        entryPrice: askPrice,
+        side,
+        marketSlug: market.slug,
+        marketEndDate: market.endDate
+      });
+
+      // Deduct from paper balance
+      this.state.balance = 0;
+
+      this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
+    } else {
+      // Real trading
+      const balance = await this.trader.getBalance();
+      if (balance < 1) {
+        this.log("Insufficient balance");
+        return;
+      }
+
+      const result = await this.trader.buy(tokenId, askPrice, balance);
+      if (!result) {
+        this.log("Order failed");
+        return;
+      }
+
+      // Record trade
+      const tradeId = insertTrade({
+        market_slug: market.slug,
+        token_id: tokenId,
+        side,
+        entry_price: askPrice,
+        shares: result.shares,
+        cost_basis: balance,
+        created_at: new Date().toISOString(),
+        market_end_date: market.endDate.toISOString()
+      });
+
+      this.state.positions.set(tokenId, {
+        tradeId,
+        tokenId,
+        shares: result.shares,
+        entryPrice: askPrice,
+        side,
+        marketSlug: market.slug,
+        marketEndDate: market.endDate
+      });
+
+      this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
     }
-
-    const result = await this.trader.buy(tokenId, askPrice, balance);
-    if (!result) {
-      this.log("Order failed");
-      return;
-    }
-
-    // Record trade
-    const tradeId = insertTrade({
-      market_slug: market.slug,
-      token_id: tokenId,
-      side,
-      entry_price: askPrice,
-      shares: result.shares,
-      cost_basis: balance,
-      created_at: new Date().toISOString()
-    });
-
-    this.state.positions.set(tokenId, {
-      tradeId,
-      tokenId,
-      shares: result.shares,
-      entryPrice: askPrice,
-      side,
-      marketSlug: market.slug
-    });
-
-    this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
   }
 
   getState(): BotState {

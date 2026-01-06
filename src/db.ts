@@ -15,9 +15,17 @@ db.run(`
     status TEXT NOT NULL DEFAULT 'OPEN',
     pnl REAL,
     created_at TEXT NOT NULL,
-    closed_at TEXT
+    closed_at TEXT,
+    market_end_date TEXT
   )
 `);
+
+// Add market_end_date column if it doesn't exist (for existing DBs)
+try {
+  db.run("ALTER TABLE trades ADD COLUMN market_end_date TEXT");
+} catch {
+  // Column already exists
+}
 
 export interface Trade {
   id: number;
@@ -32,12 +40,13 @@ export interface Trade {
   pnl: number | null;
   created_at: string;
   closed_at: string | null;
+  market_end_date: string | null;
 }
 
 export function insertTrade(trade: Omit<Trade, "id" | "exit_price" | "pnl" | "closed_at" | "status">): number {
   const stmt = db.prepare(`
-    INSERT INTO trades (market_slug, token_id, side, entry_price, shares, cost_basis, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)
+    INSERT INTO trades (market_slug, token_id, side, entry_price, shares, cost_basis, status, created_at, market_end_date)
+    VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
   `);
   const result = stmt.run(
     trade.market_slug,
@@ -46,7 +55,8 @@ export function insertTrade(trade: Omit<Trade, "id" | "exit_price" | "pnl" | "cl
     trade.entry_price,
     trade.shares,
     trade.cost_basis,
-    trade.created_at
+    trade.created_at,
+    trade.market_end_date
   );
   return Number(result.lastInsertRowid);
 }
@@ -90,11 +100,12 @@ export function getTradeStats() {
   const losses = db.prepare("SELECT COUNT(*) as count FROM trades WHERE pnl < 0").get() as { count: number };
   const open = db.prepare("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'").get() as { count: number };
 
+  const closedTrades = wins.count + losses.count;
   return {
     total: total.count,
     wins: wins.count,
     losses: losses.count,
     open: open.count,
-    winRate: total.count > 0 ? (wins.count / (wins.count + losses.count)) * 100 : 0
+    winRate: closedTrades > 0 ? (wins.count / closedTrades) * 100 : 0
   };
 }

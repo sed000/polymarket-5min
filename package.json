@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts"
+    "dev": "bun --watch run src/index.ts",
+    "reset": "rm -f trades.db && echo 'Database reset successfully'"
   },
   "dependencies": {
     "@polymarket/clob-client": "^4.0.0",
