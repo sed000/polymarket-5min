@@ -17,19 +17,30 @@ const config: BotConfig = {
 };
 
 async function main() {
-  console.log("Initializing Polymarket BTC Bot...");
+  console.log("Initializing Polymarket BTC Bot...\n");
 
-  const bot = new Bot(PRIVATE_KEY, config, (msg) => {
+  const bot = new Bot(PRIVATE_KEY, config, () => {
     // Logs are handled by UI
   });
 
+  // Suppress verbose axios errors during init
+  const originalError = console.error;
+  console.error = (...args: any[]) => {
+    const msg = args[0]?.toString() || "";
+    // Only suppress axios/CLOB verbose errors
+    if (msg.includes("request error") || msg.includes("CLOB Client")) {
+      return;
+    }
+    originalError.apply(console, args);
+  };
+
   try {
     await bot.init();
-    renderUI(bot);
-  } catch (err) {
-    console.error("Failed to initialize bot:", err);
-    process.exit(1);
+  } finally {
+    console.error = originalError;
   }
+
+  renderUI(bot);
 }
 
 main();

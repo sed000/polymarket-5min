@@ -12,11 +12,18 @@ export interface Position {
   marketSlug: string;
 }
 
+export interface ApiCreds {
+  key: string;
+  secret: string;
+  passphrase: string;
+}
+
 export class Trader {
   private client: ClobClient | null = null;
   private signer: Wallet;
   private initialized = false;
   private initError: string | null = null;
+  private apiCreds: ApiCreds | null = null;
 
   constructor(privateKey: string) {
     this.signer = new Wallet(privateKey);
@@ -24,23 +31,48 @@ export class Trader {
 
   async init(): Promise<void> {
     try {
-      // Create temp client to get API credentials
-      const tempClient = new ClobClient(CLOB_API, CHAIN_ID, this.signer);
-      const apiCreds = await tempClient.createOrDeriveApiKey();
+      let creds: { key: string; secret: string; passphrase: string };
+
+      // Check if API credentials are provided via environment
+      const envKey = process.env.POLY_API_KEY;
+      const envSecret = process.env.POLY_API_SECRET;
+      const envPassphrase = process.env.POLY_API_PASSPHRASE;
+
+      if (envKey && envSecret && envPassphrase) {
+        // Use provided credentials
+        creds = { key: envKey, secret: envSecret, passphrase: envPassphrase };
+      } else {
+        // Auto-generate credentials from wallet
+        const tempClient = new ClobClient(CLOB_API, CHAIN_ID, this.signer);
+        creds = await tempClient.createOrDeriveApiKey();
+      }
+
+      // Store credentials for WebSocket auth
+      this.apiCreds = {
+        key: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase
+      };
 
       // Create authenticated client
       this.client = new ClobClient(
         CLOB_API,
         CHAIN_ID,
         this.signer,
-        apiCreds,
+        creds,
         0 // EOA signature type
       );
       this.initialized = true;
     } catch (err: any) {
-      this.initError = err?.response?.data?.error || err?.message || "Unknown error";
-      console.error(`[CLOB Client] ${this.initError}`);
-      // Continue without trading capability - can still view markets
+      // Extract clean error message
+      if (err?.response?.data?.error) {
+        this.initError = err.response.data.error;
+      } else if (err?.message) {
+        this.initError = err.message;
+      } else {
+        this.initError = "Could not connect to CLOB API";
+      }
+      // Don't log verbose error - it's handled in bot.ts
     }
   }
 
@@ -50,6 +82,10 @@ export class Trader {
 
   getInitError(): string | null {
     return this.initError;
+  }
+
+  getApiCreds(): ApiCreds | null {
+    return this.apiCreds;
   }
 
   private ensureClient(): ClobClient {

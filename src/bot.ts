@@ -1,6 +1,7 @@
 import { Trader } from "./trader";
-import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type EligibleMarket } from "./scanner";
+import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, type Trade } from "./db";
+import { getPriceStream, type PriceStream } from "./websocket";
 
 export interface BotConfig {
   entryThreshold: number;  // e.g., 0.95
@@ -17,6 +18,8 @@ export interface BotState {
   logs: string[];
   tradingEnabled: boolean;
   initError: string | null;
+  wsConnected: boolean;
+  markets: Market[];
 }
 
 export type LogCallback = (message: string) => void;
@@ -27,11 +30,13 @@ export class Bot {
   private state: BotState;
   private interval: Timer | null = null;
   private onLog: LogCallback;
+  private priceStream: PriceStream;
 
   constructor(privateKey: string, config: BotConfig, onLog: LogCallback = console.log) {
     this.trader = new Trader(privateKey);
     this.config = config;
     this.onLog = onLog;
+    this.priceStream = getPriceStream();
     this.state = {
       running: false,
       balance: 0,
@@ -39,15 +44,41 @@ export class Bot {
       lastScan: null,
       logs: [],
       tradingEnabled: false,
-      initError: null
+      initError: null,
+      wsConnected: false,
+      markets: []
     };
   }
 
   async init(): Promise<void> {
+    // Fetch initial markets
+    try {
+      this.state.markets = await fetchBtc15MinMarkets();
+      if (this.state.markets.length > 0) {
+        this.log(`Found ${this.state.markets.length} active markets`);
+      }
+    } catch (err) {
+      this.log("Failed to fetch markets");
+    }
+
+    // Initialize trader
     await this.trader.init();
 
     const walletAddr = this.trader.getAddress();
     this.log(`Wallet: ${walletAddr.slice(0, 10)}...${walletAddr.slice(-8)}`);
+
+    // Connect WebSocket for real-time prices (market channel is public, no auth needed)
+    try {
+      await this.priceStream.connect();
+      this.state.wsConnected = true;
+      this.log("WebSocket connected for real-time prices");
+
+      if (this.state.markets.length > 0) {
+        this.subscribeToMarkets(this.state.markets);
+      }
+    } catch (err) {
+      this.log("WebSocket connection failed, using Gamma API");
+    }
 
     if (this.trader.isReady()) {
       this.state.tradingEnabled = true;
@@ -72,7 +103,7 @@ export class Bot {
     } else {
       this.state.initError = this.trader.getInitError();
       this.log(`Trading disabled: ${this.state.initError}`);
-      this.log("Tip: Register wallet on polymarket.com first");
+      this.log("Tip: Ensure API keys match your wallet");
     }
   }
 
@@ -84,6 +115,36 @@ export class Bot {
       this.state.logs.shift();
     }
     this.onLog(formatted);
+  }
+
+  private subscribeToMarkets(markets: Market[]): void {
+    const tokenIds: string[] = [];
+    for (const market of markets) {
+      if (market.clobTokenIds) {
+        tokenIds.push(...market.clobTokenIds);
+      }
+    }
+    if (tokenIds.length > 0) {
+      this.priceStream.subscribe(tokenIds);
+    }
+  }
+
+  private getPriceOverrides(): PriceOverride | undefined {
+    if (!this.state.wsConnected) return undefined;
+
+    const overrides: PriceOverride = {};
+    for (const market of this.state.markets) {
+      for (const tokenId of market.clobTokenIds) {
+        const wsPrice = this.priceStream.getPrice(tokenId);
+        if (wsPrice) {
+          overrides[tokenId] = {
+            bestBid: wsPrice.bestBid,
+            bestAsk: wsPrice.bestAsk
+          };
+        }
+      }
+    }
+    return Object.keys(overrides).length > 0 ? overrides : undefined;
   }
 
   async start(): Promise<void> {
@@ -134,11 +195,19 @@ export class Bot {
   private async checkStopLosses(): Promise<void> {
     for (const [tokenId, position] of this.state.positions) {
       try {
-        const { mid: currentPrice } = await this.trader.getPrice(tokenId);
+        // Use WebSocket price if available, otherwise fall back to REST API
+        let currentPrice: number;
+        const wsPrice = this.priceStream.getPrice(tokenId);
+        if (wsPrice && this.state.wsConnected) {
+          currentPrice = wsPrice.price;
+        } else {
+          const { mid } = await this.trader.getPrice(tokenId);
+          currentPrice = mid;
+        }
 
         // Check if stop-loss triggered (price dropped to 85% or below)
         if (currentPrice <= this.config.stopLoss) {
-          this.log(`Stop-loss triggered for ${position.side} @ ${currentPrice.toFixed(3)}`);
+          this.log(`Stop-loss triggered for ${position.side} @ $${currentPrice.toFixed(2)}`);
 
           const result = await this.trader.marketSell(tokenId, position.shares);
           if (result) {
@@ -156,10 +225,16 @@ export class Bot {
 
   private async scanForEntries(): Promise<void> {
     try {
-      const eligible = await findEligibleMarkets({
+      // Refresh markets list
+      this.state.markets = await fetchBtc15MinMarkets();
+      this.subscribeToMarkets(this.state.markets);
+
+      // Use WebSocket prices if available for more accurate signals
+      const priceOverrides = this.getPriceOverrides();
+      const eligible = findEligibleMarkets(this.state.markets, {
         entryThreshold: this.config.entryThreshold,
         timeWindowMs: this.config.timeWindowMs
-      });
+      }, priceOverrides);
 
       for (const market of eligible) {
         // Skip if we already have a position in this market
@@ -176,9 +251,9 @@ export class Bot {
   private async enterPosition(market: EligibleMarket): Promise<void> {
     const side = market.eligibleSide!;
     const tokenId = side === "UP" ? market.upTokenId : market.downTokenId;
-    const price = side === "UP" ? market.upPrice : market.downPrice;
+    const askPrice = side === "UP" ? market.upAsk : market.downAsk;
 
-    this.log(`Entry signal: ${side} @ ${price.toFixed(3)} (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
+    this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
     // Use full balance
     const balance = await this.trader.getBalance();
@@ -187,7 +262,7 @@ export class Bot {
       return;
     }
 
-    const result = await this.trader.buy(tokenId, price, balance);
+    const result = await this.trader.buy(tokenId, askPrice, balance);
     if (!result) {
       this.log("Order failed");
       return;
@@ -198,7 +273,7 @@ export class Bot {
       market_slug: market.slug,
       token_id: tokenId,
       side,
-      entry_price: price,
+      entry_price: askPrice,
       shares: result.shares,
       cost_basis: balance,
       created_at: new Date().toISOString()
@@ -208,12 +283,12 @@ export class Bot {
       tradeId,
       tokenId,
       shares: result.shares,
-      entryPrice: price,
+      entryPrice: askPrice,
       side,
       marketSlug: market.slug
     });
 
-    this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ ${price.toFixed(3)}`);
+    this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
   }
 
   getState(): BotState {
@@ -225,10 +300,19 @@ export class Bot {
   }
 
   async getMarketOverview(): Promise<EligibleMarket[]> {
-    const markets = await fetchBtc15MinMarkets();
-    return markets.map(m => analyzeMarket(m, {
+    // Always fetch fresh market data for accurate prices
+    this.state.markets = await fetchBtc15MinMarkets();
+    this.subscribeToMarkets(this.state.markets);
+
+    // Use WebSocket prices if available for more accurate display
+    const priceOverrides = this.getPriceOverrides();
+    return this.state.markets.map(m => analyzeMarket(m, {
       entryThreshold: this.config.entryThreshold,
       timeWindowMs: this.config.timeWindowMs
-    }));
+    }, priceOverrides));
+  }
+
+  isWsConnected(): boolean {
+    return this.state.wsConnected;
   }
 }

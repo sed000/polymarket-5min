@@ -19,146 +19,142 @@ export interface EligibleMarket {
   timeRemaining: number; // ms
   upTokenId: string;
   downTokenId: string;
-  upPrice: number;
-  downPrice: number;
+  upAsk: number;  // Best ask - price to buy Up
+  downAsk: number; // Best ask - price to buy Down
+  upBid: number;  // Best bid - price to sell Up
+  downBid: number; // Best bid - price to sell Down
   eligibleSide: "UP" | "DOWN" | null;
-}
-
-// Generate potential BTC 15-min market slugs based on current time
-function generatePotentialSlugs(): string[] {
-  const now = Date.now();
-  const slugs: string[] = [];
-
-  // Generate slugs for next few 15-minute intervals
-  for (let i = 0; i < 10; i++) {
-    // Round to 15-minute intervals
-    const timestamp = Math.floor((now + i * 15 * 60 * 1000) / (15 * 60 * 1000)) * (15 * 60);
-    slugs.push(`btc-updown-15m-${timestamp}`);
-  }
-
-  return slugs;
 }
 
 export async function fetchBtc15MinMarkets(): Promise<Market[]> {
   const markets: Market[] = [];
 
-  // Method 1: Query the series directly
-  try {
-    const seriesRes = await fetch(`${GAMMA_API}/events?slug=btc-up-or-down-15m&active=true&closed=false&limit=20`);
-    if (seriesRes.ok) {
-      const events = await seriesRes.json();
-      for (const event of events) {
-        if (event.slug?.includes("btc-updown-15m") || event.slug?.includes("btc-up-or-down")) {
-          for (const market of event.markets || []) {
-            if (!market.closed && market.active) {
-              markets.push(parseMarket(event, market));
-            }
-          }
-        }
-      }
-    }
-  } catch (e) {
-    // Continue to other methods
-  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const intervalSec = 15 * 60;
+  const currentIntervalStart = Math.floor(nowSec / intervalSec) * intervalSec;
 
-  // Method 2: Try specific slug queries for upcoming intervals
-  const potentialSlugs = generatePotentialSlugs();
-  for (const slug of potentialSlugs) {
+  // Get current and next market
+  for (let i = 0; i < 2; i++) {
+    const timestamp = currentIntervalStart + (i * intervalSec);
+    const slug = `btc-updown-15m-${timestamp}`;
+
     try {
       const res = await fetch(`${GAMMA_API}/events?slug=${slug}`);
-      if (res.ok) {
-        const events = await res.json();
-        for (const event of events) {
-          if (!event.closed && event.active !== false) {
-            for (const market of event.markets || []) {
-              if (!market.closed && market.active !== false) {
-                // Check if not already added
-                if (!markets.find(m => m.id === market.id)) {
-                  markets.push(parseMarket(event, market));
-                }
-              }
-            }
+      if (!res.ok) continue;
+
+      const events = await res.json();
+      if (!Array.isArray(events) || events.length === 0) continue;
+
+      for (const event of events) {
+        if (!event.markets || !Array.isArray(event.markets)) continue;
+
+        for (const market of event.markets) {
+          if (market.closed) continue;
+
+          const parsed = parseMarket(event, market);
+          if (parsed && !markets.find(m => m.id === parsed.id)) {
+            markets.push(parsed);
           }
         }
       }
     } catch {
-      // Skip this slug
+      // Skip failed requests
     }
   }
 
-  // Method 3: Search all events and filter
-  try {
-    const allRes = await fetch(`${GAMMA_API}/events?active=true&closed=false&limit=200`);
-    if (allRes.ok) {
-      const events = await allRes.json();
-      for (const event of events) {
-        if (event.slug?.includes("btc-updown-15m") ||
-            event.title?.toLowerCase().includes("bitcoin up or down")) {
-          for (const market of event.markets || []) {
-            if (!market.closed && !markets.find(m => m.id === market.id)) {
-              markets.push(parseMarket(event, market));
-            }
-          }
-        }
-      }
-    }
-  } catch {
-    // Ignore
-  }
-
+  markets.sort((a, b) => new Date(a.endDate).getTime() - new Date(b.endDate).getTime());
   return markets;
 }
 
-function parseMarket(event: any, market: any): Market {
-  // Parse outcomes from string if needed
-  let outcomes: string[] = [];
-  let outcomePrices: string[] = [];
-  let clobTokenIds: string[] = [];
-
+function parseMarket(event: any, market: any): Market | null {
   try {
-    outcomes = typeof market.outcomes === 'string' ? JSON.parse(market.outcomes) : (market.outcomes || []);
-    outcomePrices = typeof market.outcomePrices === 'string' ? JSON.parse(market.outcomePrices) : (market.outcomePrices || []);
-    clobTokenIds = typeof market.clobTokenIds === 'string' ? JSON.parse(market.clobTokenIds) : (market.clobTokenIds || []);
-  } catch {
-    outcomes = market.outcomes || [];
-    outcomePrices = market.outcomePrices || [];
-    clobTokenIds = market.clobTokenIds || [];
-  }
+    let outcomes: string[] = [];
+    let outcomePrices: string[] = [];
+    let clobTokenIds: string[] = [];
 
-  return {
-    id: market.id,
-    slug: event.slug,
-    question: market.question || event.title,
-    endDate: market.endDate || event.endDate,
-    outcomes,
-    outcomePrices,
-    clobTokenIds,
-    active: market.active !== false,
-    closed: market.closed === true
-  };
+    if (typeof market.outcomes === 'string') {
+      outcomes = JSON.parse(market.outcomes);
+    } else if (Array.isArray(market.outcomes)) {
+      outcomes = market.outcomes;
+    }
+
+    if (typeof market.outcomePrices === 'string') {
+      outcomePrices = JSON.parse(market.outcomePrices);
+    } else if (Array.isArray(market.outcomePrices)) {
+      outcomePrices = market.outcomePrices;
+    }
+
+    if (typeof market.clobTokenIds === 'string') {
+      clobTokenIds = JSON.parse(market.clobTokenIds);
+    } else if (Array.isArray(market.clobTokenIds)) {
+      clobTokenIds = market.clobTokenIds;
+    }
+
+    if (outcomes.length < 2 || clobTokenIds.length < 2) {
+      return null;
+    }
+
+    return {
+      id: market.id,
+      slug: event.slug,
+      question: market.question || event.title,
+      endDate: market.endDate || event.endDate,
+      outcomes,
+      outcomePrices,
+      clobTokenIds,
+      active: market.active !== false,
+      closed: market.closed === true
+    };
+  } catch {
+    return null;
+  }
 }
 
-export function analyzeMarket(market: Market, config: { entryThreshold: number; timeWindowMs: number }): EligibleMarket {
+export interface PriceData {
+  bestBid: number;
+  bestAsk: number;
+}
+
+export interface PriceOverride {
+  [tokenId: string]: PriceData;
+}
+
+export function analyzeMarket(
+  market: Market,
+  config: { entryThreshold: number; timeWindowMs: number },
+  priceOverrides?: PriceOverride
+): EligibleMarket {
   const endDate = new Date(market.endDate);
   const now = new Date();
   const timeRemaining = endDate.getTime() - now.getTime();
 
-  // Parse prices - outcomes are typically ["Up", "Down"]
   const upIndex = market.outcomes.findIndex(o => o.toLowerCase() === "up");
   const downIndex = market.outcomes.findIndex(o => o.toLowerCase() === "down");
-
-  const upPrice = upIndex >= 0 ? parseFloat(market.outcomePrices[upIndex]) : 0;
-  const downPrice = downIndex >= 0 ? parseFloat(market.outcomePrices[downIndex]) : 0;
 
   const upTokenId = upIndex >= 0 ? market.clobTokenIds[upIndex] : "";
   const downTokenId = downIndex >= 0 ? market.clobTokenIds[downIndex] : "";
 
+  // Get bid/ask from WebSocket orderbook data
+  let upBid = 0, upAsk = 0;
+  let downBid = 0, downAsk = 0;
+
+  if (priceOverrides && upTokenId && priceOverrides[upTokenId]) {
+    upBid = priceOverrides[upTokenId].bestBid;
+    upAsk = priceOverrides[upTokenId].bestAsk;
+  }
+  if (priceOverrides && downTokenId && priceOverrides[downTokenId]) {
+    downBid = priceOverrides[downTokenId].bestBid;
+    downAsk = priceOverrides[downTokenId].bestAsk;
+  }
+
+  // Entry signal based on best ask (price you pay to buy)
+  // If ask >= 0.95, market strongly favors that outcome (95%+ probability)
   let eligibleSide: "UP" | "DOWN" | null = null;
 
   if (timeRemaining > 0 && timeRemaining <= config.timeWindowMs) {
-    if (upPrice >= config.entryThreshold) {
+    if (upAsk >= config.entryThreshold) {
       eligibleSide = "UP";
-    } else if (downPrice >= config.entryThreshold) {
+    } else if (downAsk >= config.entryThreshold) {
       eligibleSide = "DOWN";
     }
   }
@@ -170,15 +166,20 @@ export function analyzeMarket(market: Market, config: { entryThreshold: number; 
     timeRemaining,
     upTokenId,
     downTokenId,
-    upPrice,
-    downPrice,
+    upAsk,
+    downAsk,
+    upBid,
+    downBid,
     eligibleSide
   };
 }
 
-export async function findEligibleMarkets(config: { entryThreshold: number; timeWindowMs: number }): Promise<EligibleMarket[]> {
-  const markets = await fetchBtc15MinMarkets();
-  const analyzed = markets.map(m => analyzeMarket(m, config));
+export function findEligibleMarkets(
+  markets: Market[],
+  config: { entryThreshold: number; timeWindowMs: number },
+  priceOverrides?: PriceOverride
+): EligibleMarket[] {
+  const analyzed = markets.map(m => analyzeMarket(m, config, priceOverrides));
   return analyzed.filter(m => m.eligibleSide !== null);
 }
 

@@ -14,24 +14,27 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
       <Box justifyContent="space-between">
         <Text bold color="cyan">POLYMARKET BTC 15-MIN BOT</Text>
         <Box gap={2}>
+          <Text color={state.wsConnected ? "green" : "yellow"}>
+            {state.wsConnected ? "WS" : "REST"}
+          </Text>
           {!state.tradingEnabled && (
-            <Text color="yellow">WATCH ONLY</Text>
+            <Text color="yellow">WATCH</Text>
           )}
           <Text color={state.running ? "green" : "red"}>
-            {state.running ? "● RUNNING" : "○ STOPPED"}
+            {state.running ? "● RUN" : "○ STOP"}
           </Text>
         </Box>
       </Box>
       {state.initError && (
         <Box marginTop={1}>
-          <Text color="red">API Error: {state.initError}</Text>
+          <Text color="red" wrap="truncate">Error: {state.initError}</Text>
         </Box>
       )}
       <Box marginTop={1} gap={4}>
         <Text>Balance: <Text color="green">${state.balance.toFixed(2)}</Text></Text>
-        <Text>Entry: <Text color="yellow">≥{(config.entryThreshold * 100).toFixed(0)}%</Text></Text>
-        <Text>Stop-Loss: <Text color="red">≤{(config.stopLoss * 100).toFixed(0)}%</Text></Text>
-        <Text>Open: <Text color="cyan">{state.positions.size}</Text></Text>
+        <Text>Entry: <Text color="yellow">≥${config.entryThreshold.toFixed(2)}</Text></Text>
+        <Text>Stop: <Text color="red">≤${config.stopLoss.toFixed(2)}</Text></Text>
+        <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
       </Box>
     </Box>
   );
@@ -40,35 +43,35 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
 function MarketsTable({ markets }: { markets: EligibleMarket[] }) {
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1} marginTop={1}>
-      <Text bold color="white">Active BTC 15-Min Markets</Text>
+      <Text bold color="white">Active BTC 15-Min Markets (Bid/Ask)</Text>
       <Box marginTop={1} flexDirection="column">
         <Box>
-          <Box width={20}><Text color="gray">Time Left</Text></Box>
-          <Box width={12}><Text color="gray">Up</Text></Box>
-          <Box width={12}><Text color="gray">Down</Text></Box>
-          <Box width={10}><Text color="gray">Signal</Text></Box>
+          <Box width={12}><Text color="gray">Time</Text></Box>
+          <Box width={14}><Text color="gray">Up</Text></Box>
+          <Box width={14}><Text color="gray">Down</Text></Box>
+          <Box width={8}><Text color="gray">Signal</Text></Box>
         </Box>
         {markets.length === 0 ? (
           <Text color="gray">No active markets found</Text>
         ) : (
           markets.slice(0, 5).map((m, i) => (
             <Box key={i}>
-              <Box width={20}>
+              <Box width={12}>
                 <Text color={m.timeRemaining < 300000 ? "yellow" : "white"}>
                   {formatTimeRemaining(m.timeRemaining)}
                 </Text>
               </Box>
-              <Box width={12}>
-                <Text color={m.upPrice >= 0.95 ? "green" : "white"}>
-                  {(m.upPrice * 100).toFixed(1)}%
+              <Box width={14}>
+                <Text color={m.upAsk >= 0.95 ? "green" : "white"}>
+                  {m.upBid.toFixed(2)}/{m.upAsk.toFixed(2)}
                 </Text>
               </Box>
-              <Box width={12}>
-                <Text color={m.downPrice >= 0.95 ? "green" : "white"}>
-                  {(m.downPrice * 100).toFixed(1)}%
+              <Box width={14}>
+                <Text color={m.downAsk >= 0.95 ? "green" : "white"}>
+                  {m.downBid.toFixed(2)}/{m.downAsk.toFixed(2)}
                 </Text>
               </Box>
-              <Box width={10}>
+              <Box width={8}>
                 {m.eligibleSide ? (
                   <Text color="green" bold>{m.eligibleSide}</Text>
                 ) : (
@@ -105,7 +108,7 @@ function PositionsTable({ state }: { state: BotState }) {
                 <Text color={p.side === "UP" ? "green" : "red"}>{p.side}</Text>
               </Box>
               <Box width={12}>
-                <Text>{(p.entryPrice * 100).toFixed(1)}%</Text>
+                <Text>${p.entryPrice.toFixed(2)}</Text>
               </Box>
               <Box width={12}>
                 <Text>{p.shares.toFixed(2)}</Text>
@@ -156,10 +159,10 @@ function TradesTable({ trades }: { trades: Trade[] }) {
                 <Text color={t.side === "UP" ? "green" : "red"}>{t.side}</Text>
               </Box>
               <Box width={10}>
-                <Text>{(t.entry_price * 100).toFixed(1)}%</Text>
+                <Text>${t.entry_price.toFixed(2)}</Text>
               </Box>
               <Box width={10}>
-                <Text>{t.exit_price ? `${(t.exit_price * 100).toFixed(1)}%` : "-"}</Text>
+                <Text>{t.exit_price ? `$${t.exit_price.toFixed(2)}` : "-"}</Text>
               </Box>
               <Box width={12}>
                 {t.pnl !== null ? (
@@ -218,7 +221,8 @@ function App({ bot }: AppProps) {
 
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 5000);
+    // Refresh every 2 seconds (fetching from Gamma API)
+    const interval = setInterval(refresh, 1000);
     return () => clearInterval(interval);
   }, []);
 
