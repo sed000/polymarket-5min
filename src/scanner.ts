@@ -33,8 +33,8 @@ export async function fetchBtc15MinMarkets(): Promise<Market[]> {
   const intervalSec = 15 * 60;
   const currentIntervalStart = Math.floor(nowSec / intervalSec) * intervalSec;
 
-  // Fetch current + next 4 intervals (markets are created ahead of time)
-  for (let i = 0; i < 5; i++) {
+  // Fetch current and next interval
+  for (let i = 0; i < 2; i++) {
     const timestamp = currentIntervalStart + (i * intervalSec);
     const slug = `btc-updown-15m-${timestamp}`;
 
