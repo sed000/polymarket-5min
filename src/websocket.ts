@@ -90,6 +90,12 @@ export class PriceStream {
   }
 
   private handleMessage(data: any) {
+    // Debug: log message types
+    const msgType = data.event_type || data.type || (Array.isArray(data) ? 'array' : 'unknown');
+    if (msgType !== 'unknown' && msgType !== 'last_trade_price') {
+      // console.log(`[WS] Message type: ${msgType}`);
+    }
+
     // Handle different message types
     if (data.event_type === "book" || data.type === "book" || data.bids || data.asks) {
       this.handleBookUpdate(data);

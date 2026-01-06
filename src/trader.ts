@@ -156,6 +156,32 @@ export class Trader {
     }
   }
 
+  async limitSell(tokenId: string, shares: number, price: number): Promise<{ orderId: string; price: number } | null> {
+    const client = this.ensureClient();
+
+    try {
+      const response = await client.createAndPostOrder({
+        tokenID: tokenId,
+        price,
+        size: shares,
+        side: Side.SELL,
+        feeRateBps: 0
+      });
+
+      if (response.success) {
+        return {
+          orderId: response.orderID || "",
+          price
+        };
+      }
+      console.error("Limit sell failed:", response.errorMsg);
+      return null;
+    } catch (err) {
+      console.error("Limit sell error:", err);
+      return null;
+    }
+  }
+
   async marketSell(tokenId: string, shares: number): Promise<{ orderId: string; price: number } | null> {
     const client = this.ensureClient();
 
@@ -197,6 +223,26 @@ export class Trader {
     } catch {
       return [];
     }
+  }
+
+  async getOrder(orderId: string): Promise<any | null> {
+    const client = this.ensureClient();
+    try {
+      const order = await client.getOrder(orderId);
+      return order;
+    } catch {
+      return null;
+    }
+  }
+
+  async isOrderFilled(orderId: string): Promise<boolean> {
+    const order = await this.getOrder(orderId);
+    if (!order) return false;
+
+    // Order is filled if status is 'MATCHED' or if size_matched equals original_size
+    return order.status === "MATCHED" ||
+           (order.size_matched && order.original_size &&
+            parseFloat(order.size_matched) >= parseFloat(order.original_size));
   }
 
   async cancelOrder(orderId: string): Promise<boolean> {

@@ -3,6 +3,8 @@ import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type Eligible
 import { insertTrade, closeTrade, getOpenTrades, type Trade } from "./db";
 import { getPriceStream, type PriceStream } from "./websocket";
 
+const PROFIT_TARGET = 0.99; // Auto-sell at $0.99 for profit
+
 export interface BotConfig {
   entryThreshold: number;  // e.g., 0.95
   stopLoss: number;        // e.g., 0.85
@@ -20,6 +22,7 @@ export interface Position {
   side: "UP" | "DOWN";
   marketSlug: string;
   marketEndDate: Date;
+  limitOrderId?: string; // Limit sell order at $0.99
 }
 
 export interface BotState {
@@ -44,6 +47,8 @@ export class Bot {
   private interval: Timer | null = null;
   private onLog: LogCallback;
   private priceStream: PriceStream;
+  private lastMarketRefresh: Date | null = null;
+  private marketRefreshInterval = 30000; // Refresh markets every 30 seconds
 
   constructor(privateKey: string, config: BotConfig, onLog: LogCallback = console.log) {
     this.trader = new Trader(privateKey);
@@ -212,14 +217,21 @@ export class Bot {
       }
     }
     if (tokenIds.length > 0) {
+      const beforeCount = this.priceStream.getPriceCount();
       this.priceStream.subscribe(tokenIds);
 
       // Log subscription status
       if (!this.priceStream.isConnected()) {
         this.log(`Warning: WebSocket not connected, prices may be delayed`);
       } else {
-        // Give WebSocket a moment to receive initial book snapshots
-        await new Promise(resolve => setTimeout(resolve, 500));
+        this.log(`Subscribed to ${tokenIds.length} tokens, waiting for prices...`);
+
+        // Give WebSocket time to receive initial book snapshots
+        await new Promise(resolve => setTimeout(resolve, 1500));
+
+        const afterCount = this.priceStream.getPriceCount();
+        const newPrices = afterCount - beforeCount;
+        this.log(`Received ${newPrices} price updates (total: ${afterCount})`);
       }
     }
   }
@@ -278,6 +290,9 @@ export class Bot {
         this.state.balance = await this.trader.getBalance();
       }
 
+      // Check for limit order fills (profit taking)
+      await this.checkLimitOrderFills();
+
       // Check for expired markets first (close at $0.99)
       await this.checkExpiredPositions();
 
@@ -290,6 +305,47 @@ export class Bot {
       }
     } catch (err) {
       this.log(`Error in tick: ${err}`);
+    }
+  }
+
+  private async checkLimitOrderFills(): Promise<void> {
+    for (const [tokenId, position] of this.state.positions) {
+      if (!position.limitOrderId) continue;
+
+      try {
+        if (this.config.paperTrading) {
+          // Paper trading: check if price hit $0.99
+          const wsPrice = this.priceStream.getPrice(tokenId);
+          if (wsPrice && wsPrice.bestBid >= PROFIT_TARGET) {
+            // Simulate limit order fill at profit target
+            const exitPrice = PROFIT_TARGET;
+            const proceeds = exitPrice * position.shares;
+            const pnl = (exitPrice - position.entryPrice) * position.shares;
+
+            closeTrade(position.tradeId, exitPrice, "RESOLVED");
+            this.state.positions.delete(tokenId);
+            this.state.balance += proceeds;
+
+            this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+            this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
+          }
+        } else {
+          // Real trading: check if order is filled
+          const isFilled = await this.trader.isOrderFilled(position.limitOrderId);
+          if (isFilled) {
+            const exitPrice = PROFIT_TARGET;
+            const proceeds = exitPrice * position.shares;
+            const pnl = (exitPrice - position.entryPrice) * position.shares;
+
+            closeTrade(position.tradeId, exitPrice, "RESOLVED");
+            this.state.positions.delete(tokenId);
+
+            this.log(`Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+          }
+        }
+      } catch (err) {
+        this.log(`Error checking limit order: ${err}`);
+      }
     }
   }
 
@@ -314,8 +370,14 @@ export class Bot {
           this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
           this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
         } else {
-          // Real trading: market sell
+          // Real trading: cancel limit order then market sell
           try {
+            // Cancel the limit order if it exists
+            if (position.limitOrderId) {
+              await this.trader.cancelOrder(position.limitOrderId);
+              this.log(`Cancelled unfilled limit order`);
+            }
+
             const result = await this.trader.marketSell(tokenId, position.shares);
             if (result) {
               closeTrade(position.tradeId, result.price, "RESOLVED");
@@ -360,7 +422,13 @@ export class Bot {
             const pnl = (exitPrice - position.entryPrice) * position.shares;
             this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
           } else {
-            // Real trading
+            // Real trading: cancel limit order then market sell
+            // Cancel the limit order if it exists
+            if (position.limitOrderId) {
+              await this.trader.cancelOrder(position.limitOrderId);
+              this.log(`Cancelled limit order`);
+            }
+
             const result = await this.trader.marketSell(tokenId, position.shares);
             if (result) {
               closeTrade(position.tradeId, result.price, "STOPPED");
@@ -406,6 +474,12 @@ export class Bot {
     const tokenId = side === "UP" ? market.upTokenId : market.downTokenId;
     const askPrice = side === "UP" ? market.upAsk : market.downAsk;
 
+    // Don't buy if price is already at or above profit target
+    if (askPrice >= PROFIT_TARGET) {
+      this.log(`Skipping entry: ask price $${askPrice.toFixed(2)} >= profit target $${PROFIT_TARGET.toFixed(2)}`);
+      return;
+    }
+
     this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
     if (this.config.paperTrading) {
@@ -438,13 +512,15 @@ export class Bot {
         entryPrice: askPrice,
         side,
         marketSlug: market.slug,
-        marketEndDate: market.endDate
+        marketEndDate: market.endDate,
+        limitOrderId: "paper-limit-" + tradeId // Simulated limit order
       });
 
       // Deduct from paper balance
       this.state.balance = 0;
 
       this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
+      this.log(`[PAPER] Placed limit sell @ $${PROFIT_TARGET.toFixed(2)}`);
     } else {
       // Real trading
       const balance = await this.trader.getBalance();
@@ -457,6 +533,16 @@ export class Bot {
       if (!result) {
         this.log("Order failed");
         return;
+      }
+
+      // Place limit sell order at profit target
+      let limitOrderId: string | undefined;
+      const limitResult = await this.trader.limitSell(tokenId, result.shares, PROFIT_TARGET);
+      if (limitResult) {
+        limitOrderId = limitResult.orderId;
+        this.log(`Placed limit sell @ $${PROFIT_TARGET.toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
+      } else {
+        this.log("Warning: Could not place limit sell order");
       }
 
       // Record trade
@@ -478,7 +564,8 @@ export class Bot {
         entryPrice: askPrice,
         side,
         marketSlug: market.slug,
-        marketEndDate: market.endDate
+        marketEndDate: market.endDate,
+        limitOrderId
       });
 
       this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
@@ -494,9 +581,16 @@ export class Bot {
   }
 
   async getMarketOverview(): Promise<EligibleMarket[]> {
-    // Always fetch fresh market data for accurate prices
-    this.state.markets = await fetchBtc15MinMarkets();
-    await this.subscribeToMarkets(this.state.markets);
+    // Only refresh markets periodically (every 30 seconds), not every UI render
+    const now = new Date();
+    const shouldRefresh = !this.lastMarketRefresh ||
+                         (now.getTime() - this.lastMarketRefresh.getTime()) > this.marketRefreshInterval;
+
+    if (shouldRefresh) {
+      this.state.markets = await fetchBtc15MinMarkets();
+      await this.subscribeToMarkets(this.state.markets);
+      this.lastMarketRefresh = now;
+    }
 
     // Use WebSocket prices if available for more accurate display
     const priceOverrides = this.getPriceOverrides();
