@@ -9,13 +9,25 @@ interface AppProps {
 }
 
 function Header({ state, config }: { state: BotState; config: BotConfig }) {
+  const isSuperRisk = config.riskMode === "super-risk";
+  const borderColor = isSuperRisk ? "magenta" : state.paperTrading ? "yellow" : "cyan";
+
+  // Get active config values based on risk mode
+  const activeEntry = isSuperRisk ? 0.70 : config.entryThreshold;
+  const activeMaxEntry = isSuperRisk ? 0.95 : config.maxEntryPrice;
+  const activeStop = isSuperRisk ? 0.40 : config.stopLoss;
+  const activeDelay = isSuperRisk ? 0 : config.stopLossDelayMs;
+
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={state.paperTrading ? "yellow" : "cyan"} paddingX={1}>
+    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
       <Box justifyContent="space-between">
-        <Text bold color={state.paperTrading ? "yellow" : "cyan"}>
+        <Text bold color={borderColor}>
           POLYMARKET BTC 15-MIN BOT {state.paperTrading && "[PAPER]"}
         </Text>
         <Box gap={2}>
+          {isSuperRisk && (
+            <Text color="magenta" bold>SUPER-RISK</Text>
+          )}
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
           </Text>
@@ -37,8 +49,9 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
       )}
       <Box marginTop={1} gap={4}>
         <Text>Balance: <Text color="green">${state.balance.toFixed(2)}</Text></Text>
-        <Text>Entry: <Text color="yellow">≥${config.entryThreshold.toFixed(2)}</Text></Text>
-        <Text>Stop: <Text color="red">≤${config.stopLoss.toFixed(2)}</Text></Text>
+        <Text>Entry: <Text color={isSuperRisk ? "magenta" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
+        <Text>Stop: <Text color="red">≤${activeStop.toFixed(2)}</Text></Text>
+        {activeDelay > 0 && <Text>Delay: <Text color="cyan">{activeDelay / 1000}s</Text></Text>}
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
       </Box>
     </Box>

@@ -119,9 +119,16 @@ export interface PriceOverride {
   [tokenId: string]: PriceData;
 }
 
+export interface MarketFilterConfig {
+  entryThreshold: number;   // Min entry price (0.95)
+  maxEntryPrice: number;    // Max entry price (0.98)
+  maxSpread: number;        // Max bid-ask spread (0.03)
+  timeWindowMs: number;
+}
+
 export function analyzeMarket(
   market: Market,
-  config: { entryThreshold: number; timeWindowMs: number },
+  config: { entryThreshold: number; timeWindowMs: number; maxEntryPrice?: number; maxSpread?: number },
   priceOverrides?: PriceOverride
 ): EligibleMarket {
   const endDate = new Date(market.endDate);
@@ -148,13 +155,21 @@ export function analyzeMarket(
   }
 
   // Entry signal based on best ask (price you pay to buy)
-  // If ask >= 0.95, market strongly favors that outcome (95%+ probability)
+  // Apply entry threshold, max entry price, and spread filters
   let eligibleSide: "UP" | "DOWN" | null = null;
+  const maxEntry = config.maxEntryPrice ?? 0.99;
+  const maxSpread = config.maxSpread ?? 1.0;  // Default: no spread filter
 
   if (timeRemaining > 0 && timeRemaining <= config.timeWindowMs) {
-    if (upAsk >= config.entryThreshold) {
+    const upSpread = upAsk - upBid;
+    const downSpread = downAsk - downBid;
+
+    // Check UP side: within entry range AND spread OK
+    if (upAsk >= config.entryThreshold && upAsk <= maxEntry && upSpread <= maxSpread) {
       eligibleSide = "UP";
-    } else if (downAsk >= config.entryThreshold) {
+    }
+    // Check DOWN side: within entry range AND spread OK
+    else if (downAsk >= config.entryThreshold && downAsk <= maxEntry && downSpread <= maxSpread) {
       eligibleSide = "DOWN";
     }
   }
@@ -176,7 +191,7 @@ export function analyzeMarket(
 
 export function findEligibleMarkets(
   markets: Market[],
-  config: { entryThreshold: number; timeWindowMs: number },
+  config: { entryThreshold: number; timeWindowMs: number; maxEntryPrice?: number; maxSpread?: number },
   priceOverrides?: PriceOverride
 ): EligibleMarket[] {
   const analyzed = markets.map(m => analyzeMarket(m, config, priceOverrides));

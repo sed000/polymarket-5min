@@ -15,11 +15,15 @@ if (!PRIVATE_KEY && !paperTrading) {
 
 const config: BotConfig = {
   entryThreshold: parseFloat(process.env.ENTRY_THRESHOLD || "0.95"),
-  stopLoss: parseFloat(process.env.STOP_LOSS || "0.85"),
+  maxEntryPrice: parseFloat(process.env.MAX_ENTRY_PRICE || "0.98"),
+  stopLoss: parseFloat(process.env.STOP_LOSS || "0.80"),
+  stopLossDelayMs: parseInt(process.env.STOP_LOSS_DELAY_MS || "5000"),
+  maxSpread: parseFloat(process.env.MAX_SPREAD || "0.03"),
   timeWindowMs: parseInt(process.env.TIME_WINDOW_MINS || "5") * 60 * 1000,
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000"),
   paperTrading,
-  paperBalance: parseFloat(process.env.PAPER_BALANCE || "100")
+  paperBalance: parseFloat(process.env.PAPER_BALANCE || "100"),
+  riskMode: (process.env.RISK_MODE || "normal") as "normal" | "super-risk"
 };
 
 async function main() {

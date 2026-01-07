@@ -5,13 +5,19 @@ import { getPriceStream, type PriceStream } from "./websocket";
 
 const PROFIT_TARGET = 0.99; // Auto-sell at $0.99 for profit
 
+export type RiskMode = "normal" | "super-risk";
+
 export interface BotConfig {
   entryThreshold: number;  // e.g., 0.95
-  stopLoss: number;        // e.g., 0.85
+  maxEntryPrice: number;   // e.g., 0.98 - avoid ceiling price
+  stopLoss: number;        // e.g., 0.80
+  stopLossDelayMs: number; // e.g., 5000 - confirmation delay in ms
+  maxSpread: number;       // e.g., 0.03 - max bid-ask spread
   timeWindowMs: number;    // e.g., 5 * 60 * 1000
   pollIntervalMs: number;  // e.g., 10 * 1000
   paperTrading: boolean;   // Simulate trades with virtual money
   paperBalance: number;    // Starting balance for paper trading
+  riskMode: RiskMode;      // "normal" or "super-risk"
 }
 
 export interface Position {
@@ -23,6 +29,10 @@ export interface Position {
   marketSlug: string;
   marketEndDate: Date;
   limitOrderId?: string; // Limit sell order at $0.99
+  pendingStopLoss?: {
+    triggeredAt: number;  // Timestamp when stop-loss first triggered
+    triggeredPrice: number;
+  };
 }
 
 export interface BotState {
@@ -66,6 +76,31 @@ export class Bot {
       wsConnected: false,
       markets: [],
       paperTrading: config.paperTrading
+    };
+  }
+
+  /**
+   * Get active trading config based on risk mode
+   * SUPER-RISK mode uses more aggressive parameters
+   */
+  private getActiveConfig() {
+    if (this.config.riskMode === "super-risk") {
+      return {
+        entryThreshold: 0.70,
+        maxEntryPrice: 0.95,
+        stopLoss: 0.40,
+        timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
+        stopLossDelayMs: 0,  // No delay for super-risk - immediate stop-loss
+        maxSpread: 0.05  // Allow wider spreads for volatile entries
+      };
+    }
+    return {
+      entryThreshold: this.config.entryThreshold,
+      maxEntryPrice: this.config.maxEntryPrice,
+      stopLoss: this.config.stopLoss,
+      timeWindowMs: this.config.timeWindowMs,
+      stopLossDelayMs: this.config.stopLossDelayMs,
+      maxSpread: this.config.maxSpread
     };
   }
 
@@ -400,6 +435,9 @@ export class Bot {
   }
 
   private async checkStopLosses(): Promise<void> {
+    const now = Date.now();
+    const activeConfig = this.getActiveConfig();
+
     for (const [tokenId, position] of this.state.positions) {
       try {
         // Use WebSocket price if available, otherwise fall back to REST API
@@ -414,34 +452,55 @@ export class Bot {
           continue; // Skip if no price available in paper mode
         }
 
-        // Check if stop-loss triggered (price dropped to stop-loss level)
-        if (currentBid <= this.config.stopLoss) {
-          this.log(`Stop-loss triggered for ${position.side} @ $${currentBid.toFixed(2)}`);
+        // Check if price is below stop-loss threshold
+        if (currentBid <= activeConfig.stopLoss) {
+          // First time triggering? Start the timer
+          if (!position.pendingStopLoss) {
+            position.pendingStopLoss = {
+              triggeredAt: now,
+              triggeredPrice: currentBid
+            };
+            const delaySec = activeConfig.stopLossDelayMs / 1000;
+            this.log(`Stop-loss pending for ${position.side} @ $${currentBid.toFixed(2)} (${delaySec}s confirm)`);
+            continue;
+          }
 
-          if (this.config.paperTrading) {
-            // Paper trading: simulate sell at bid price
-            const exitPrice = currentBid;
-            const proceeds = exitPrice * position.shares;
-            closeTrade(position.tradeId, exitPrice, "STOPPED");
-            this.state.positions.delete(tokenId);
-            this.state.balance += proceeds;
-            const pnl = (exitPrice - position.entryPrice) * position.shares;
-            this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
-          } else {
-            // Real trading: cancel limit order then market sell
-            // Cancel the limit order if it exists
-            if (position.limitOrderId) {
-              await this.trader.cancelOrder(position.limitOrderId);
-              this.log(`Cancelled limit order`);
-            }
+          // Check if delay has passed
+          const elapsed = now - position.pendingStopLoss.triggeredAt;
+          if (elapsed >= activeConfig.stopLossDelayMs) {
+            // Confirmed - execute stop-loss
+            this.log(`Stop-loss CONFIRMED for ${position.side} @ $${currentBid.toFixed(2)} (held ${(elapsed / 1000).toFixed(1)}s)`);
 
-            const result = await this.trader.marketSell(tokenId, position.shares);
-            if (result) {
-              closeTrade(position.tradeId, result.price, "STOPPED");
+            if (this.config.paperTrading) {
+              // Paper trading: simulate sell at bid price
+              const exitPrice = currentBid;
+              const proceeds = exitPrice * position.shares;
+              closeTrade(position.tradeId, exitPrice, "STOPPED");
               this.state.positions.delete(tokenId);
-              const pnl = (result.price - position.entryPrice) * position.shares;
-              this.log(`Closed position. PnL: $${pnl.toFixed(2)}`);
+              this.state.balance += proceeds;
+              const pnl = (exitPrice - position.entryPrice) * position.shares;
+              this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+            } else {
+              // Real trading: cancel limit order then market sell
+              if (position.limitOrderId) {
+                await this.trader.cancelOrder(position.limitOrderId);
+                this.log(`Cancelled limit order`);
+              }
+
+              const result = await this.trader.marketSell(tokenId, position.shares);
+              if (result) {
+                closeTrade(position.tradeId, result.price, "STOPPED");
+                this.state.positions.delete(tokenId);
+                const pnl = (result.price - position.entryPrice) * position.shares;
+                this.log(`Closed position. PnL: $${pnl.toFixed(2)}`);
+              }
             }
+          }
+        } else {
+          // Price recovered - cancel pending stop-loss
+          if (position.pendingStopLoss) {
+            this.log(`Stop-loss cancelled for ${position.side} - price recovered to $${currentBid.toFixed(2)}`);
+            position.pendingStopLoss = undefined;
           }
         }
       } catch (err) {
@@ -452,6 +511,8 @@ export class Bot {
 
   private async scanForEntries(): Promise<void> {
     try {
+      const activeConfig = this.getActiveConfig();
+
       // Refresh markets list
       this.state.markets = await fetchBtc15MinMarkets();
       await this.subscribeToMarkets(this.state.markets);
@@ -459,8 +520,10 @@ export class Bot {
       // Use WebSocket prices if available for more accurate signals
       const priceOverrides = this.getPriceOverrides();
       const eligible = findEligibleMarkets(this.state.markets, {
-        entryThreshold: this.config.entryThreshold,
-        timeWindowMs: this.config.timeWindowMs
+        entryThreshold: activeConfig.entryThreshold,
+        timeWindowMs: activeConfig.timeWindowMs,
+        maxEntryPrice: activeConfig.maxEntryPrice,
+        maxSpread: activeConfig.maxSpread
       }, priceOverrides);
 
       for (const market of eligible) {
@@ -476,17 +539,33 @@ export class Bot {
   }
 
   private async enterPosition(market: EligibleMarket): Promise<void> {
+    const activeConfig = this.getActiveConfig();
     const side = market.eligibleSide!;
     const tokenId = side === "UP" ? market.upTokenId : market.downTokenId;
     const askPrice = side === "UP" ? market.upAsk : market.downAsk;
+    const bidPrice = side === "UP" ? market.upBid : market.downBid;
 
     // Don't buy if price is already at or above profit target
     if (askPrice >= PROFIT_TARGET) {
-      this.log(`Skipping entry: ask price $${askPrice.toFixed(2)} >= profit target $${PROFIT_TARGET.toFixed(2)}`);
+      this.log(`Skipping: ask $${askPrice.toFixed(2)} >= profit target $${PROFIT_TARGET.toFixed(2)}`);
       return;
     }
 
-    this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
+    // Don't buy if price is above max entry (ceiling filter)
+    if (askPrice > activeConfig.maxEntryPrice) {
+      this.log(`Skipping: ask $${askPrice.toFixed(2)} > max entry $${activeConfig.maxEntryPrice.toFixed(2)}`);
+      return;
+    }
+
+    // Don't buy if spread is too wide (liquidity filter)
+    const spread = askPrice - bidPrice;
+    if (spread > activeConfig.maxSpread) {
+      this.log(`Skipping: spread $${spread.toFixed(2)} > max $${activeConfig.maxSpread.toFixed(2)}`);
+      return;
+    }
+
+    const modeLabel = this.config.riskMode === "super-risk" ? "[SUPER-RISK] " : "";
+    this.log(`${modeLabel}Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
     if (this.config.paperTrading) {
       // Paper trading: simulate buy at ask price
@@ -587,6 +666,8 @@ export class Bot {
   }
 
   async getMarketOverview(): Promise<EligibleMarket[]> {
+    const activeConfig = this.getActiveConfig();
+
     // Only refresh markets periodically (every 30 seconds), not every UI render
     const now = new Date();
     const shouldRefresh = !this.lastMarketRefresh ||
@@ -601,8 +682,10 @@ export class Bot {
     // Use WebSocket prices if available for more accurate display
     const priceOverrides = this.getPriceOverrides();
     return this.state.markets.map(m => analyzeMarket(m, {
-      entryThreshold: this.config.entryThreshold,
-      timeWindowMs: this.config.timeWindowMs
+      entryThreshold: activeConfig.entryThreshold,
+      timeWindowMs: activeConfig.timeWindowMs,
+      maxEntryPrice: activeConfig.maxEntryPrice,
+      maxSpread: activeConfig.maxSpread
     }, priceOverrides));
   }
 
