@@ -21,6 +21,7 @@ export class PriceStream {
   private reconnectTimer: Timer | null = null;
   private pingTimer: Timer | null = null;
   private connected = false;
+  private intentionalReconnect = false;
 
   constructor() {}
 
@@ -62,6 +63,8 @@ export class PriceStream {
             if (msg === "PONG") return;
 
             const data = JSON.parse(msg);
+            // Debug: uncomment to see all messages
+            // console.log("[WS RAW]", JSON.stringify(data).slice(0, 200));
             this.handleMessage(data);
           } catch {
             // Ignore parse errors
@@ -79,8 +82,10 @@ export class PriceStream {
             clearInterval(this.pingTimer);
             this.pingTimer = null;
           }
-          // Reconnect after 3 seconds
-          this.reconnectTimer = setTimeout(() => this.connect(), 3000);
+          // Reconnect immediately if intentional, otherwise wait 3 seconds
+          const delay = this.intentionalReconnect ? 100 : 3000;
+          this.intentionalReconnect = false;
+          this.reconnectTimer = setTimeout(() => this.connect(), delay);
         };
 
       } catch (err) {
@@ -245,8 +250,11 @@ export class PriceStream {
   }
 
   private sendSubscription(tokenIds: string[]) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      return;
+    }
 
+    // console.log(`[WS] Subscribing to ${tokenIds.length} tokens`);
     const msg = {
       assets_ids: tokenIds,
       type: "market"
@@ -258,13 +266,24 @@ export class PriceStream {
     // Filter to only new token IDs we haven't subscribed to yet
     const newTokenIds = tokenIds.filter(id => !this.subscriptions.has(id));
 
+    if (newTokenIds.length === 0) return;
+
     for (const id of newTokenIds) {
       this.subscriptions.add(id);
     }
 
-    // Only send subscription if we have new tokens
-    if (newTokenIds.length > 0 && this.connected && this.ws?.readyState === WebSocket.OPEN) {
-      this.sendSubscription(newTokenIds);
+    // Polymarket WebSocket doesn't properly handle subscription updates on existing connections
+    // Force a reconnect to subscribe to new tokens
+    if (this.connected && this.ws?.readyState === WebSocket.OPEN) {
+      this.reconnect();
+    }
+  }
+
+  private reconnect() {
+    // Close current connection (onclose handler will auto-reconnect)
+    this.intentionalReconnect = true;
+    if (this.ws) {
+      this.ws.close();
     }
   }
 

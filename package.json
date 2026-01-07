@@ -5,7 +5,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
-    "db:view": "sqlite3 -box trades.db \"SELECT id, market_slug, substr(token_id, 1, 10) || '...' as token, side, entry_price, exit_price, printf('%.2f', shares) as shares, printf('%.2f', pnl) as pnl, status, datetime(created_at, 'localtime') as created_at FROM trades\"",
+    "db:view": "sqlite3 -box trades.db \"SELECT id, side, entry_price, exit_price, printf('%.2f', shares) as shares, printf('%.2f', pnl) as pnl, status, datetime(created_at, 'localtime') as created_at FROM trades UNION ALL SELECT '---' as id, '---' as side, '---' as entry_price, '---' as exit_price, '---' as shares, printf('%.2f', (SELECT SUM(pnl) FROM trades)) as pnl, 'TOTAL' as status, '---' as created_at\"",
     "reset": "rm -f trades.db && echo 'Database reset successfully'"
   },
   "dependencies": {

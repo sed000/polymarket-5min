@@ -231,7 +231,13 @@ export class Bot {
 
         const afterCount = this.priceStream.getPriceCount();
         const newPrices = afterCount - beforeCount;
-        this.log(`Received ${newPrices} price updates (total: ${afterCount})`);
+
+        if (newPrices > 0) {
+          this.log(`Received ${newPrices} new price updates (total: ${afterCount})`);
+        } else {
+          // Prices are still updating in real-time even if no NEW tokens were added
+          this.log(`Tracking ${afterCount} live prices via WebSocket`);
+        }
       }
     }
   }
