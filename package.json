@@ -5,8 +5,15 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
-    "db:view": "sqlite3 -box trades.db \"SELECT id, side, entry_price, exit_price, printf('%.2f', shares) as shares, printf('%.2f', pnl) as pnl, status, datetime(created_at, 'localtime') as created_at FROM trades UNION ALL SELECT '---' as id, '---' as side, '---' as entry_price, '---' as exit_price, '---' as shares, printf('%.2f', (SELECT SUM(pnl) FROM trades)) as pnl, 'TOTAL' as status, '---' as created_at\"",
-    "reset": "rm -f trades.db && echo 'Database reset successfully'"
+    "db:real": "sqlite3 -header -column trades_real.db \"SELECT id, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
+    "db:paper": "sqlite3 -header -column trades_paper_normal.db \"SELECT id, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
+    "db:risk": "sqlite3 -header -column trades_paper_risk.db \"SELECT id, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
+    "db:stats:real": "sqlite3 trades_real.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
+    "db:stats:paper": "sqlite3 trades_paper_normal.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
+    "db:stats:risk": "sqlite3 trades_paper_risk.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
+    "db:reset:real": "rm -f trades_real.db && echo 'Real trading DB reset'",
+    "db:reset:paper": "rm -f trades_paper_normal.db && echo 'Paper normal DB reset'",
+    "db:reset:risk": "rm -f trades_paper_risk.db && echo 'Paper risk DB reset'"
   },
   "dependencies": {
     "@polymarket/clob-client": "^4.0.0",

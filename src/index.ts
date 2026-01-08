@@ -1,5 +1,6 @@
 import { Bot, type BotConfig } from "./bot";
 import { renderUI } from "./ui";
+import { initDatabase } from "./db";
 
 const paperTrading = process.env.PAPER_TRADING === "true";
 
@@ -23,11 +24,18 @@ const config: BotConfig = {
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000"),
   paperTrading,
   paperBalance: parseFloat(process.env.PAPER_BALANCE || "100"),
-  riskMode: (process.env.RISK_MODE || "normal") as "normal" | "super-risk"
+  riskMode: (process.env.RISK_MODE || "normal") as "normal" | "super-risk",
+  compoundLimit: parseFloat(process.env.COMPOUND_LIMIT || "0"),
+  baseBalance: parseFloat(process.env.BASE_BALANCE || "10"),
+  signatureType: parseInt(process.env.SIGNATURE_TYPE || "1") as 0 | 1 | 2,
+  funderAddress: process.env.FUNDER_ADDRESS
 };
 
 async function main() {
   console.log("Initializing Polymarket BTC Bot...\n");
+
+  // Initialize database based on mode
+  initDatabase(config.paperTrading, config.riskMode);
 
   // In paper trading mode, PRIVATE_KEY is optional
   const privateKey = PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001";

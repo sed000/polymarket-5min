@@ -4,6 +4,12 @@ import { Wallet } from "ethers";
 const CLOB_API = "https://clob.polymarket.com";
 const CHAIN_ID = 137; // Polygon
 
+// Signature types for different wallet types
+// 0 = EOA (MetaMask direct)
+// 1 = Poly Proxy (Magic.link / email sign-up)
+// 2 = Gnosis Safe
+export type SignatureType = 0 | 1 | 2;
+
 export interface Position {
   tokenId: string;
   side: "UP" | "DOWN";
@@ -24,9 +30,13 @@ export class Trader {
   private initialized = false;
   private initError: string | null = null;
   private apiCreds: ApiCreds | null = null;
+  private signatureType: SignatureType;
+  private funderAddress: string | undefined;
 
-  constructor(privateKey: string) {
+  constructor(privateKey: string, signatureType: SignatureType = 1, funderAddress?: string) {
     this.signer = new Wallet(privateKey);
+    this.signatureType = signatureType;
+    this.funderAddress = funderAddress;
   }
 
   async init(): Promise<void> {
@@ -43,7 +53,16 @@ export class Trader {
         creds = { key: envKey, secret: envSecret, passphrase: envPassphrase };
       } else {
         // Auto-generate credentials from wallet
-        const tempClient = new ClobClient(CLOB_API, CHAIN_ID, this.signer);
+        // For proxy wallets, need to pass funder address
+        const tempClient = new ClobClient(
+          CLOB_API,
+          CHAIN_ID,
+          this.signer,
+          undefined,
+          this.signatureType,
+          this.funderAddress
+        );
+        // Use createOrDeriveApiKey - creates if not exists, derives if exists
         creds = await tempClient.createOrDeriveApiKey();
       }
 
@@ -54,13 +73,14 @@ export class Trader {
         passphrase: creds.passphrase
       };
 
-      // Create authenticated client
+      // Create authenticated client with funder address for proxy wallets
       this.client = new ClobClient(
         CLOB_API,
         CHAIN_ID,
         this.signer,
         creds,
-        0 // EOA signature type
+        this.signatureType, // 0=EOA, 1=Poly Proxy (Magic.link), 2=Gnosis Safe
+        this.funderAddress  // Proxy wallet address (required for signature type 1)
       );
       this.initialized = true;
     } catch (err: any) {

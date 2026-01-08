@@ -14,11 +14,9 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
 
   // Get active config values based on risk mode
   const activeEntry = isSuperRisk ? 0.70 : config.entryThreshold;
+  const activeMaxEntry = isSuperRisk ? 0.95 : config.maxEntryPrice;
   const activeStop = isSuperRisk ? 0.40 : config.stopLoss;
   const activeDelay = isSuperRisk ? 0 : config.stopLossDelayMs;
-  // For super-risk, max entry is limited by risk/reward ratio (0.5 min)
-  // Formula: entry <= (0.99 + 0.5 * stopLoss) / 1.5 = ~0.79 for stopLoss=0.40
-  const activeMaxEntry = isSuperRisk ? 0.79 : config.maxEntryPrice;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
@@ -51,6 +49,9 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
       )}
       <Box marginTop={1} gap={4}>
         <Text>Balance: <Text color="green">${state.balance.toFixed(2)}</Text></Text>
+        {state.savedProfit > 0 && (
+          <Text>Saved: <Text color="cyan">${state.savedProfit.toFixed(2)}</Text></Text>
+        )}
         <Text>Entry: <Text color={isSuperRisk ? "magenta" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
         <Text>Stop: <Text color="red">≤${activeStop.toFixed(2)}</Text></Text>
         {activeDelay > 0 && <Text>Delay: <Text color="cyan">{activeDelay / 1000}s</Text></Text>}
@@ -106,38 +107,51 @@ function MarketsTable({ markets }: { markets: EligibleMarket[] }) {
   );
 }
 
-function PositionsTable({ state }: { state: BotState }) {
+function PositionsTable({ state, config }: { state: BotState; config: BotConfig }) {
   const positions = Array.from(state.positions.values());
+
+  // Get active stop-loss based on risk mode
+  const isSuperRisk = config.riskMode === "super-risk";
+  const stopLoss = isSuperRisk ? 0.40 : config.stopLoss;
+  const profitTarget = 0.99;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1} marginTop={1}>
       <Text bold color="white">Open Positions</Text>
       <Box marginTop={1} flexDirection="column">
         <Box>
-          <Box width={8}><Text color="gray">Side</Text></Box>
-          <Box width={12}><Text color="gray">Entry</Text></Box>
-          <Box width={12}><Text color="gray">Shares</Text></Box>
-          <Box width={20}><Text color="gray">Market</Text></Box>
+          <Box width={6}><Text color="gray">Side</Text></Box>
+          <Box width={8}><Text color="gray">Entry</Text></Box>
+          <Box width={8}><Text color="gray">Shares</Text></Box>
+          <Box width={10}><Text color="gray">Win</Text></Box>
+          <Box width={10}><Text color="gray">Loss</Text></Box>
         </Box>
         {positions.length === 0 ? (
           <Text color="gray">No open positions</Text>
         ) : (
-          positions.map((p, i) => (
-            <Box key={i}>
-              <Box width={8}>
-                <Text color={p.side === "UP" ? "green" : "red"}>{p.side}</Text>
+          positions.map((p, i) => {
+            const potentialWin = (profitTarget - p.entryPrice) * p.shares;
+            const potentialLoss = (p.entryPrice - stopLoss) * p.shares;
+            return (
+              <Box key={i}>
+                <Box width={6}>
+                  <Text color={p.side === "UP" ? "green" : "red"}>{p.side}</Text>
+                </Box>
+                <Box width={8}>
+                  <Text>${p.entryPrice.toFixed(2)}</Text>
+                </Box>
+                <Box width={8}>
+                  <Text>{p.shares.toFixed(1)}</Text>
+                </Box>
+                <Box width={10}>
+                  <Text color="green">+${potentialWin.toFixed(2)}</Text>
+                </Box>
+                <Box width={10}>
+                  <Text color="red">-${potentialLoss.toFixed(2)}</Text>
+                </Box>
               </Box>
-              <Box width={12}>
-                <Text>${p.entryPrice.toFixed(2)}</Text>
-              </Box>
-              <Box width={12}>
-                <Text>{p.shares.toFixed(2)}</Text>
-              </Box>
-              <Box width={20}>
-                <Text color="gray">{p.marketSlug.slice(0, 18)}</Text>
-              </Box>
-            </Box>
-          ))
+            );
+          })
         )}
       </Box>
     </Box>
@@ -268,7 +282,7 @@ function App({ bot }: AppProps) {
       <Box>
         <Box flexDirection="column" width="50%">
           <MarketsTable markets={markets} />
-          <PositionsTable state={state} />
+          <PositionsTable state={state} config={bot.getConfig()} />
         </Box>
         <Box flexDirection="column" width="50%" marginLeft={1}>
           <TradesTable trades={trades} />

@@ -1,4 +1,4 @@
-import { Trader } from "./trader";
+import { Trader, type SignatureType } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, type Trade } from "./db";
 import { getPriceStream, type PriceStream } from "./websocket";
@@ -18,6 +18,10 @@ export interface BotConfig {
   paperTrading: boolean;   // Simulate trades with virtual money
   paperBalance: number;    // Starting balance for paper trading
   riskMode: RiskMode;      // "normal" or "super-risk"
+  compoundLimit: number;   // e.g., 15 - take profit when balance exceeds this
+  baseBalance: number;     // e.g., 10 - reset to this after taking profit
+  signatureType: SignatureType; // 0=EOA, 1=Poly Proxy (Magic.link), 2=Gnosis Safe
+  funderAddress?: string;  // Proxy wallet address (required for signature type 1)
 }
 
 export interface Position {
@@ -38,6 +42,7 @@ export interface Position {
 export interface BotState {
   running: boolean;
   balance: number;
+  savedProfit: number;  // Profit taken out via compound limit
   positions: Map<string, Position>;
   lastScan: Date | null;
   logs: string[];
@@ -61,13 +66,14 @@ export class Bot {
   private marketRefreshInterval = 30000; // Refresh markets every 30 seconds
 
   constructor(privateKey: string, config: BotConfig, onLog: LogCallback = console.log) {
-    this.trader = new Trader(privateKey);
+    this.trader = new Trader(privateKey, config.signatureType, config.funderAddress);
     this.config = config;
     this.onLog = onLog;
     this.priceStream = getPriceStream();
     this.state = {
       running: false,
       balance: config.paperTrading ? config.paperBalance : 0,
+      savedProfit: 0,
       positions: new Map(),
       lastScan: null,
       logs: [],
@@ -91,8 +97,7 @@ export class Bot {
         stopLoss: 0.40,
         timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
         stopLossDelayMs: 0,  // No delay for super-risk - immediate stop-loss
-        maxSpread: 0.05,  // Allow wider spreads for volatile entries
-        minRiskReward: 0.5  // Reward must be at least 50% of risk (max entry ~$0.79)
+        maxSpread: 0.05  // Allow wider spreads for volatile entries
       };
     }
     return {
@@ -101,8 +106,7 @@ export class Bot {
       stopLoss: this.config.stopLoss,
       timeWindowMs: this.config.timeWindowMs,
       stopLossDelayMs: this.config.stopLossDelayMs,
-      maxSpread: this.config.maxSpread,
-      minRiskReward: 0.25  // Reward must be at least 25% of risk (allows up to ~$0.95)
+      maxSpread: this.config.maxSpread
     };
   }
 
@@ -126,6 +130,14 @@ export class Bot {
       } else {
         this.log("WebSocket disconnected, will reconnect...");
       }
+    });
+
+    // Real-time price monitoring via WebSocket
+    this.priceStream.onPrice((update) => {
+      // Real-time stop-loss check
+      this.checkStopLossRealtime(update.tokenId, update.bestBid);
+      // Real-time entry check
+      this.checkEntryRealtime(update.tokenId, update.bestBid, update.bestAsk);
     });
 
     try {
@@ -246,6 +258,64 @@ export class Bot {
     this.onLog(formatted);
   }
 
+  /**
+   * Check if balance exceeds compound limit and take profit if so
+   * For PAPER trading: Resets trading balance to base and saves the profit
+   */
+  private checkCompoundLimit(): void {
+    const { compoundLimit, baseBalance } = this.config;
+
+    // Skip if compound limit is disabled (0 or not set)
+    if (!compoundLimit || compoundLimit <= 0) return;
+
+    // Check if balance exceeds the limit
+    if (this.state.balance > compoundLimit) {
+      const profit = this.state.balance - baseBalance;
+      this.state.savedProfit += profit;
+      this.state.balance = baseBalance;
+
+      this.log(`COMPOUND LIMIT: Saved $${profit.toFixed(2)} profit (total saved: $${this.state.savedProfit.toFixed(2)})`);
+      this.log(`Reset balance to $${baseBalance.toFixed(2)}`);
+    }
+  }
+
+  /**
+   * Apply compound limit for REAL trading
+   * Tracks saved profit but money stays in wallet - we just limit trading amount
+   */
+  private applyCompoundLimit(walletBalance: number): void {
+    const { compoundLimit, baseBalance } = this.config;
+
+    // Skip if compound limit is disabled (0 or not set)
+    if (!compoundLimit || compoundLimit <= 0) {
+      this.state.balance = walletBalance;
+      return;
+    }
+
+    // If wallet balance exceeds compound limit
+    if (walletBalance > compoundLimit) {
+      // Calculate how much is "saved" (not for trading)
+      const newSavedProfit = walletBalance - baseBalance;
+
+      // Only log when savedProfit increases
+      if (newSavedProfit > this.state.savedProfit + 0.01) {
+        const profitIncrease = newSavedProfit - this.state.savedProfit;
+        this.log(`COMPOUND LIMIT: +$${profitIncrease.toFixed(2)} saved (total: $${newSavedProfit.toFixed(2)})`);
+        this.log(`Trading with $${baseBalance.toFixed(2)}, reserving $${(walletBalance - baseBalance).toFixed(2)}`);
+      }
+
+      this.state.savedProfit = newSavedProfit;
+      this.state.balance = baseBalance;  // Only trade with base amount
+    } else {
+      // Under the limit - use full balance
+      this.state.balance = walletBalance;
+      // Reset saved profit if balance dropped below limit (loss recovery)
+      if (this.state.savedProfit > 0 && walletBalance <= baseBalance) {
+        this.state.savedProfit = 0;
+      }
+    }
+  }
+
   private async subscribeToMarkets(markets: Market[]): Promise<void> {
     const tokenIds: string[] = [];
     for (const market of markets) {
@@ -330,7 +400,8 @@ export class Bot {
 
       // In paper mode, balance is managed internally
       if (!this.config.paperTrading) {
-        this.state.balance = await this.trader.getBalance();
+        const walletBalance = await this.trader.getBalance();
+        this.applyCompoundLimit(walletBalance);
       }
 
       // Check for limit order fills (profit taking)
@@ -371,6 +442,7 @@ export class Bot {
 
             this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
             this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
+            this.checkCompoundLimit();
           }
         } else {
           // Real trading: check if order is filled
@@ -412,6 +484,7 @@ export class Bot {
           this.state.balance += proceeds;
           this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
           this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
+          this.checkCompoundLimit();
         } else {
           // Real trading: cancel limit order then market sell
           try {
@@ -432,6 +505,94 @@ export class Bot {
             this.log(`Error selling expired position: ${err}`);
           }
         }
+      }
+    }
+  }
+
+  /**
+   * Real-time stop-loss check triggered by WebSocket price updates
+   * This fires IMMEDIATELY when prices change, no polling delay
+   */
+  private checkStopLossRealtime(tokenId: string, currentBid: number): void {
+    // Only check if we have a position for this token and bot is running
+    if (!this.state.running || !this.state.tradingEnabled) return;
+
+    const position = this.state.positions.get(tokenId);
+    if (!position) return;
+
+    const now = Date.now();
+    const activeConfig = this.getActiveConfig();
+
+    // Check if price is below stop-loss threshold
+    if (currentBid <= activeConfig.stopLoss) {
+      // First time triggering? Start the timer
+      if (!position.pendingStopLoss) {
+        position.pendingStopLoss = {
+          triggeredAt: now,
+          triggeredPrice: currentBid
+        };
+        const delaySec = activeConfig.stopLossDelayMs / 1000;
+        if (delaySec > 0) {
+          this.log(`[WS] Stop-loss pending for ${position.side} @ $${currentBid.toFixed(2)} (${delaySec}s confirm)`);
+        } else {
+          // No delay - execute immediately
+          this.executeStopLoss(tokenId, position, currentBid);
+        }
+        return;
+      }
+
+      // Check if delay has passed
+      const elapsed = now - position.pendingStopLoss.triggeredAt;
+      if (elapsed >= activeConfig.stopLossDelayMs) {
+        // Confirmed - execute stop-loss
+        this.executeStopLoss(tokenId, position, currentBid);
+      }
+    } else {
+      // Price recovered - cancel pending stop-loss
+      if (position.pendingStopLoss) {
+        this.log(`[WS] Stop-loss cancelled for ${position.side} - price recovered to $${currentBid.toFixed(2)}`);
+        position.pendingStopLoss = undefined;
+      }
+    }
+  }
+
+  /**
+   * Execute stop-loss sell (called from real-time or polling check)
+   */
+  private async executeStopLoss(tokenId: string, position: Position, currentBid: number): Promise<void> {
+    const elapsed = position.pendingStopLoss
+      ? (Date.now() - position.pendingStopLoss.triggeredAt) / 1000
+      : 0;
+
+    this.log(`[WS] Stop-loss TRIGGERED for ${position.side} @ $${currentBid.toFixed(2)} (held ${elapsed.toFixed(1)}s)`);
+
+    if (this.config.paperTrading) {
+      // Paper trading: simulate sell at bid price
+      const exitPrice = currentBid;
+      const proceeds = exitPrice * position.shares;
+      closeTrade(position.tradeId, exitPrice, "STOPPED");
+      this.state.positions.delete(tokenId);
+      this.state.balance += proceeds;
+      const pnl = (exitPrice - position.entryPrice) * position.shares;
+      this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+      this.checkCompoundLimit();
+    } else {
+      // Real trading: cancel limit order then market sell
+      try {
+        if (position.limitOrderId) {
+          await this.trader.cancelOrder(position.limitOrderId);
+          this.log(`Cancelled limit order`);
+        }
+
+        const result = await this.trader.marketSell(tokenId, position.shares);
+        if (result) {
+          closeTrade(position.tradeId, result.price, "STOPPED");
+          this.state.positions.delete(tokenId);
+          const pnl = (result.price - position.entryPrice) * position.shares;
+          this.log(`Closed position @ $${result.price.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+        }
+      } catch (err) {
+        this.log(`Error executing stop-loss: ${err}`);
       }
     }
   }
@@ -471,32 +632,7 @@ export class Bot {
           const elapsed = now - position.pendingStopLoss.triggeredAt;
           if (elapsed >= activeConfig.stopLossDelayMs) {
             // Confirmed - execute stop-loss
-            this.log(`Stop-loss CONFIRMED for ${position.side} @ $${currentBid.toFixed(2)} (held ${(elapsed / 1000).toFixed(1)}s)`);
-
-            if (this.config.paperTrading) {
-              // Paper trading: simulate sell at bid price
-              const exitPrice = currentBid;
-              const proceeds = exitPrice * position.shares;
-              closeTrade(position.tradeId, exitPrice, "STOPPED");
-              this.state.positions.delete(tokenId);
-              this.state.balance += proceeds;
-              const pnl = (exitPrice - position.entryPrice) * position.shares;
-              this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
-            } else {
-              // Real trading: cancel limit order then market sell
-              if (position.limitOrderId) {
-                await this.trader.cancelOrder(position.limitOrderId);
-                this.log(`Cancelled limit order`);
-              }
-
-              const result = await this.trader.marketSell(tokenId, position.shares);
-              if (result) {
-                closeTrade(position.tradeId, result.price, "STOPPED");
-                this.state.positions.delete(tokenId);
-                const pnl = (result.price - position.entryPrice) * position.shares;
-                this.log(`Closed position. PnL: $${pnl.toFixed(2)}`);
-              }
-            }
+            await this.executeStopLoss(tokenId, position, currentBid);
           }
         } else {
           // Price recovered - cancel pending stop-loss
@@ -509,6 +645,70 @@ export class Bot {
         this.log(`Error checking stop-loss: ${err}`);
       }
     }
+  }
+
+  /**
+   * Real-time entry check triggered by WebSocket price updates
+   * This fires IMMEDIATELY when prices change to catch entry opportunities
+   */
+  private checkEntryRealtime(tokenId: string, bestBid: number, bestAsk: number): void {
+    // Only check if bot is running and trading enabled
+    if (!this.state.running || !this.state.tradingEnabled) return;
+
+    // Skip if no balance
+    if (this.state.balance < 1) return;
+
+    // Skip if we already have a position for this token
+    if (this.state.positions.has(tokenId)) return;
+
+    // Find the market for this token
+    const market = this.state.markets.find(m =>
+      m.clobTokenIds.includes(tokenId)
+    );
+    if (!market) return;
+
+    const activeConfig = this.getActiveConfig();
+    const now = Date.now();
+
+    // Check time window (time remaining until market ends)
+    const timeRemaining = market.endDate.getTime() - now;
+    if (timeRemaining <= 0 || timeRemaining > activeConfig.timeWindowMs) return;
+
+    // Determine which side this token is (UP or DOWN)
+    const isUpToken = market.clobTokenIds[0] === tokenId;
+    const side: "UP" | "DOWN" = isUpToken ? "UP" : "DOWN";
+
+    // Check spread
+    const spread = bestAsk - bestBid;
+    if (spread > activeConfig.maxSpread) return;
+
+    // Check entry threshold (ask must be >= threshold and <= max)
+    if (bestAsk < activeConfig.entryThreshold || bestAsk > activeConfig.maxEntryPrice) return;
+
+    // Don't buy if price is at or above profit target
+    if (bestAsk >= PROFIT_TARGET) return;
+
+    // Check opposite-side rule
+    const lastTrade = getLastClosedTrade();
+    if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) return;
+
+    // Build eligible market object for enterPosition
+    const eligibleMarket: EligibleMarket = {
+      slug: market.slug,
+      question: market.question,
+      endDate: market.endDate,
+      upTokenId: market.clobTokenIds[0],
+      downTokenId: market.clobTokenIds[1],
+      upBid: isUpToken ? bestBid : 0,
+      upAsk: isUpToken ? bestAsk : 1,
+      downBid: isUpToken ? 0 : bestBid,
+      downAsk: isUpToken ? 1 : bestAsk,
+      timeRemaining,
+      eligibleSide: side
+    };
+
+    this.log(`[WS] Entry signal detected: ${side} @ $${bestAsk.toFixed(2)}`);
+    this.enterPosition(eligibleMarket);
   }
 
   private async scanForEntries(): Promise<void> {
@@ -563,16 +763,6 @@ export class Bot {
     const spread = askPrice - bidPrice;
     if (spread > activeConfig.maxSpread) {
       this.log(`Skipping: spread $${spread.toFixed(2)} > max $${activeConfig.maxSpread.toFixed(2)}`);
-      return;
-    }
-
-    // Risk/reward ratio check - ensure potential profit justifies the risk
-    const potentialReward = PROFIT_TARGET - askPrice;  // e.g., 0.99 - 0.71 = 0.28
-    const potentialRisk = askPrice - activeConfig.stopLoss;  // e.g., 0.71 - 0.40 = 0.31
-    const riskRewardRatio = potentialReward / potentialRisk;  // e.g., 0.28 / 0.31 = 0.90
-
-    if (riskRewardRatio < activeConfig.minRiskReward) {
-      this.log(`Skipping: risk/reward ${riskRewardRatio.toFixed(2)} < min ${activeConfig.minRiskReward} (risk $${potentialRisk.toFixed(2)}, reward $${potentialReward.toFixed(2)})`);
       return;
     }
 
