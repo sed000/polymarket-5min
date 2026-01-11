@@ -688,9 +688,13 @@ export class Bot {
     // Don't buy if price is at or above profit target
     if (bestAsk >= PROFIT_TARGET) return;
 
-    // Check opposite-side rule
+    // Check opposite-side rule (only if last trade was a WIN at 99, not a stop-loss)
     const lastTrade = getLastClosedTrade();
-    if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) return;
+    if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
+      // Only skip if previous trade sold at profit target (99) - meaning it was a win
+      // If it was a stop-loss (sold below 99), allow re-entry on same side
+      if (lastTrade.exit_price && lastTrade.exit_price >= PROFIT_TARGET) return;
+    }
 
     // Build eligible market object for enterPosition
     const eligibleMarket: EligibleMarket = {
@@ -767,12 +771,18 @@ export class Bot {
     }
 
     // Only enter OPPOSITE side of last closed trade IN THE SAME MARKET
-    // This prevents chasing the same direction after it already moved
-    // But allows fresh entries in new markets
+    // BUT only if that trade was a WIN (sold at 99) - not a stop-loss
+    // This prevents chasing the same direction after it already won
+    // But allows re-entry after a stop-loss (give it another chance)
     const lastTrade = getLastClosedTrade();
     if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
-      this.log(`Skipping: must trade opposite side in same market (last was ${lastTrade.side})`);
-      return;
+      // Only skip if previous trade sold at profit target (99) - meaning it was a win
+      if (lastTrade.exit_price && lastTrade.exit_price >= PROFIT_TARGET) {
+        this.log(`Skipping: already won ${side} at $${lastTrade.exit_price.toFixed(2)} in this market`);
+        return;
+      }
+      // If stopped out, allow re-entry - log for visibility
+      this.log(`Re-entering ${side} after stop-loss (prev exit: $${lastTrade.exit_price?.toFixed(2) || 'unknown'})`);
     }
 
     const modeLabel = this.config.riskMode === "super-risk" ? "[SUPER-RISK] " : "";
