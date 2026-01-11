@@ -13,7 +13,14 @@
     "db:stats:risk": "sqlite3 trades_paper_risk.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
     "db:reset:real": "rm -f trades_real.db && echo 'Real trading DB reset'",
     "db:reset:paper": "rm -f trades_paper_normal.db && echo 'Paper normal DB reset'",
-    "db:reset:risk": "rm -f trades_paper_risk.db && echo 'Paper risk DB reset'"
+    "db:reset:risk": "rm -f trades_paper_risk.db && echo 'Paper risk DB reset'",
+    "backtest": "bun run src/backtest/index.ts",
+    "backtest:run": "bun run src/backtest/index.ts run",
+    "backtest:fetch": "bun run src/backtest/index.ts fetch",
+    "backtest:optimize": "bun run src/backtest/index.ts optimize",
+    "backtest:compare": "bun run src/backtest/index.ts compare",
+    "backtest:history": "bun run src/backtest/index.ts history",
+    "backtest:stats": "bun run src/backtest/index.ts stats"
   },
   "dependencies": {
     "@polymarket/clob-client": "^4.0.0",

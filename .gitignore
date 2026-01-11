@@ -3,3 +3,4 @@ dist/
 .env
 trades.db
 bun.lockb
+*.db
