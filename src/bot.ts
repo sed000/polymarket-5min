@@ -92,12 +92,19 @@ export class Bot {
 
   /**
    * Get active trading config based on risk mode
-   * Both modes now use .env values for consistency - configure via environment variables
+   * SUPER-RISK mode uses more aggressive parameters
    */
   private getActiveConfig() {
-    // Both modes use the same .env-configured values
-    // super-risk vs normal is now just a label for the database
-    // Configure your risk via STOP_LOSS, ENTRY_THRESHOLD, etc. in .env
+    if (this.config.riskMode === "super-risk") {
+      return {
+        entryThreshold: 0.70,
+        maxEntryPrice: 0.95,
+        stopLoss: 0.40,
+        timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
+        stopLossDelayMs: 0,  // No delay for super-risk - immediate stop-loss
+        maxSpread: 0.05  // Allow wider spreads for volatile entries
+      };
+    }
     return {
       entryThreshold: this.config.entryThreshold,
       maxEntryPrice: this.config.maxEntryPrice,
@@ -681,7 +688,9 @@ export class Bot {
     const now = Date.now();
 
     // Check time window (time remaining until market ends)
-    const timeRemaining = market.endDate.getTime() - now;
+    // market.endDate may be a Date object or string depending on source
+    const endTime = market.endDate instanceof Date ? market.endDate.getTime() : new Date(market.endDate).getTime();
+    const timeRemaining = endTime - now;
     if (timeRemaining <= 0 || timeRemaining > activeConfig.timeWindowMs) return;
 
     // Determine which side this token is (UP or DOWN)
@@ -707,10 +716,11 @@ export class Bot {
     }
 
     // Build eligible market object for enterPosition
+    const marketEndDate = market.endDate instanceof Date ? market.endDate : new Date(market.endDate);
     const eligibleMarket: EligibleMarket = {
       slug: market.slug,
       question: market.question,
-      endDate: market.endDate,
+      endDate: marketEndDate,
       upTokenId: market.clobTokenIds[0],
       downTokenId: market.clobTokenIds[1],
       upBid: isUpToken ? bestBid : 0,
@@ -760,6 +770,8 @@ export class Bot {
     const tokenId = side === "UP" ? market.upTokenId : market.downTokenId;
     const askPrice = side === "UP" ? market.upAsk : market.downAsk;
     const bidPrice = side === "UP" ? market.upBid : market.downBid;
+    // Normalize endDate to Date object (may be string from API)
+    const endDate = market.endDate instanceof Date ? market.endDate : new Date(market.endDate);
 
     // MUTEX: Prevent concurrent entries for same token (race condition fix)
     if (this.state.pendingEntries.has(tokenId)) {
@@ -834,7 +846,7 @@ export class Bot {
           shares,
           cost_basis: balance,
           created_at: new Date().toISOString(),
-          market_end_date: market.endDate.toISOString()
+          market_end_date: endDate.toISOString()
         });
 
         this.state.positions.set(tokenId, {
@@ -844,7 +856,7 @@ export class Bot {
           entryPrice: askPrice,
           side,
           marketSlug: market.slug,
-          marketEndDate: market.endDate,
+          marketEndDate: endDate,
           limitOrderId: "paper-limit-" + tradeId // Simulated limit order
         });
 
@@ -886,7 +898,7 @@ export class Bot {
           shares: result.shares,
           cost_basis: balance,
           created_at: new Date().toISOString(),
-          market_end_date: market.endDate.toISOString()
+          market_end_date: endDate.toISOString()
         });
 
         this.state.positions.set(tokenId, {
@@ -896,7 +908,7 @@ export class Bot {
           entryPrice: askPrice,
           side,
           marketSlug: market.slug,
-          marketEndDate: market.endDate,
+          marketEndDate: endDate,
           limitOrderId
         });
 

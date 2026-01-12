@@ -267,10 +267,10 @@ function App({ bot }: AppProps) {
     } else if (input === "s") {
       if (bot.getState().running) {
         bot.stop();
+        refresh();
       } else {
-        bot.start();
+        bot.start().then(() => refresh()).catch(() => refresh());
       }
-      refresh();
     } else if (input === "r") {
       refresh();
     }
