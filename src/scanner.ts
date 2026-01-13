@@ -1,3 +1,5 @@
+import { gammaLimiter } from "./rate-limiter";
+
 const GAMMA_API = "https://gamma-api.polymarket.com";
 
 export interface Market {
@@ -39,6 +41,8 @@ export async function fetchBtc15MinMarkets(): Promise<Market[]> {
     const slug = `btc-updown-15m-${timestamp}`;
 
     try {
+      // Rate limit API calls
+      await gammaLimiter.acquire();
       const res = await fetch(`${GAMMA_API}/events?slug=${slug}`);
       if (!res.ok) continue;
 

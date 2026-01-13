@@ -1,9 +1,11 @@
-import { Trader, type SignatureType } from "./trader";
+import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, type Trade } from "./db";
 import { getPriceStream, type PriceStream } from "./websocket";
 
-const PROFIT_TARGET = 0.99; // Auto-sell at $0.99 for profit
+// Profit targets by risk mode
+const PROFIT_TARGET_NORMAL = 0.99;      // Conservative: sell at $0.99
+const PROFIT_TARGET_AGGRESSIVE = 0.98;  // Super-risk & Dynamic-risk: sell at $0.98
 
 export type RiskMode = "normal" | "super-risk" | "dynamic-risk";
 
@@ -94,6 +96,16 @@ export class Bot {
       consecutiveLosses: 0,
       consecutiveWins: 0
     };
+  }
+
+  /**
+   * Get profit target based on risk mode
+   */
+  private getProfitTarget(): number {
+    if (this.config.riskMode === "super-risk" || this.config.riskMode === "dynamic-risk") {
+      return PROFIT_TARGET_AGGRESSIVE; // $0.98
+    }
+    return PROFIT_TARGET_NORMAL; // $0.99
   }
 
   /**
@@ -239,9 +251,19 @@ export class Bot {
         this.state.balance = await this.trader.getBalance();
         this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
 
-        // Load open trades from DB
+        // Load open trades from DB and verify they still exist on Polymarket
         const openTrades = getOpenTrades();
         for (const trade of openTrades) {
+          // Verify position actually exists on Polymarket
+          const actualBalance = await this.trader.getPositionBalance(trade.token_id);
+
+          if (actualBalance < 0.01) {
+            // Position doesn't exist - was sold manually or resolved
+            this.log(`Closing stale DB position: ${trade.side} (no shares on Polymarket)`);
+            closeTrade(trade.id, 0.99, "RESOLVED"); // Assume resolved at profit
+            continue;
+          }
+
           // Try to parse end date from slug if not stored (btc-updown-15m-TIMESTAMP)
           let marketEndDate: Date;
           if (trade.market_end_date) {
@@ -257,18 +279,20 @@ export class Bot {
             }
           }
 
+          // Use actual balance from Polymarket, not DB value
           this.state.positions.set(trade.token_id, {
             tradeId: trade.id,
             tokenId: trade.token_id,
-            shares: trade.shares,
+            shares: actualBalance, // Use real balance
             entryPrice: trade.entry_price,
             side: trade.side as "UP" | "DOWN",
             marketSlug: trade.market_slug,
             marketEndDate
           });
+
+          this.log(`Loaded position: ${trade.side} with ${actualBalance.toFixed(2)} shares`);
         }
-        if (openTrades.length > 0) {
-          this.log(`Loaded ${openTrades.length} open positions`);
+        if (this.state.positions.size > 0) {
           // Check for any expired positions immediately
           await this.checkExpiredPositions();
         }
@@ -456,15 +480,13 @@ export class Bot {
 
   private async checkLimitOrderFills(): Promise<void> {
     for (const [tokenId, position] of this.state.positions) {
-      if (!position.limitOrderId) continue;
-
       try {
         if (this.config.paperTrading) {
-          // Paper trading: check if price hit $0.99
+          // Paper trading: check if price hit profit target
           const wsPrice = this.priceStream.getPrice(tokenId);
-          if (wsPrice && wsPrice.bestBid >= PROFIT_TARGET) {
+          if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
             // Simulate limit order fill at profit target
-            const exitPrice = PROFIT_TARGET;
+            const exitPrice = this.getProfitTarget();
             const proceeds = exitPrice * position.shares;
             const pnl = (exitPrice - position.entryPrice) * position.shares;
 
@@ -484,23 +506,67 @@ export class Bot {
             this.checkCompoundLimit();
           }
         } else {
-          // Real trading: check if order is filled
-          const isFilled = await this.trader.isOrderFilled(position.limitOrderId);
-          if (isFilled) {
-            const exitPrice = PROFIT_TARGET;
-            const proceeds = exitPrice * position.shares;
-            const pnl = (exitPrice - position.entryPrice) * position.shares;
+          // Real trading: check if limit order exists and is filled
+          if (position.limitOrderId) {
+            const fillInfo = await this.trader.getOrderFillInfo(position.limitOrderId);
+            if (fillInfo && fillInfo.filled) {
+              // Use ACTUAL fill price from the order, not assumed target
+              const actualExitPrice = fillInfo.avgPrice > 0 ? fillInfo.avgPrice : this.getProfitTarget();
+              const pnl = (actualExitPrice - position.entryPrice) * position.shares;
 
-            closeTrade(position.tradeId, exitPrice, "RESOLVED");
+              closeTrade(position.tradeId, actualExitPrice, "RESOLVED");
+              this.state.positions.delete(tokenId);
+
+              this.state.consecutiveWins++;
+              this.state.consecutiveLosses = 0;
+
+              this.log(`Limit order filled @ $${actualExitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+              if (this.config.riskMode === "dynamic-risk") {
+                this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
+              }
+              this.state.balance = await this.trader.getBalance();
+              continue;
+            }
+          }
+
+          // Skip if position has no shares (invalid state)
+          if (!position.shares || position.shares < 0.01) {
+            this.log(`Removing invalid position with 0 shares`);
+            closeTrade(position.tradeId, 0, "RESOLVED");
             this.state.positions.delete(tokenId);
+            continue;
+          }
 
-            // Track consecutive wins (profit target hit = win)
-            this.state.consecutiveWins++;
-            this.state.consecutiveLosses = 0;
+          // No limit order OR not filled yet - check if price hit target and sell manually
+          const wsPrice = this.priceStream.getPrice(tokenId);
+          if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
+            this.log(`Price hit profit target $${wsPrice.bestBid.toFixed(2)} - selling manually`);
 
-            this.log(`Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-            if (this.config.riskMode === "dynamic-risk") {
-              this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
+            // Cancel existing limit order if any
+            if (position.limitOrderId) {
+              await this.trader.cancelOrder(position.limitOrderId);
+            }
+
+            // Market sell at current price
+            const result = await this.trader.marketSell(tokenId, position.shares);
+            if (result) {
+              const pnl = (result.price - position.entryPrice) * position.shares;
+              closeTrade(position.tradeId, result.price, "RESOLVED");
+              this.state.positions.delete(tokenId);
+
+              this.state.consecutiveWins++;
+              this.state.consecutiveLosses = 0;
+
+              this.log(`Profit taken @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+              this.state.balance = await this.trader.getBalance();
+            }
+          } else if (!position.limitOrderId) {
+            // Try to place limit order if we don't have one
+            this.log(`Attempting to place missing limit order for ${position.side}...`);
+            const limitResult = await this.trader.limitSell(tokenId, position.shares, this.getProfitTarget());
+            if (limitResult) {
+              position.limitOrderId = limitResult.orderId;
+              this.log(`Limit order placed @ $${this.getProfitTarget().toFixed(2)}`);
             }
           }
         }
@@ -518,18 +584,38 @@ export class Bot {
       if (position.marketEndDate.getTime() > 0 && now >= position.marketEndDate) {
         this.log(`Market expired for ${position.side} position`);
 
-        // Exit at $0.99 (assuming win since we entered at >= $0.95 confidence)
-        const exitPrice = 0.99;
-        const proceeds = exitPrice * position.shares;
-        const pnl = (exitPrice - position.entryPrice) * position.shares;
-
         if (this.config.paperTrading) {
-          // Paper trading: add proceeds to balance
+          // Paper trading: Get actual price from WebSocket or estimate from market resolution
+          let exitPrice: number;
+          const wsPrice = this.priceStream.getPrice(tokenId);
+
+          if (wsPrice && wsPrice.bestBid > 0) {
+            // Use actual market price if available
+            exitPrice = wsPrice.bestBid;
+            this.log(`[PAPER] Using actual bid price: $${exitPrice.toFixed(2)}`);
+          } else {
+            // Market has resolved - price should be ~$1.00 (win) or ~$0.00 (loss)
+            // Check if our side likely won based on last known price
+            // If we don't have price data, assume resolution based on entry confidence
+            // High entry price (>0.90) suggests high confidence, likely win
+            if (position.entryPrice >= 0.90) {
+              exitPrice = 0.99; // Assume win - market resolves at $1.00 minus spread
+            } else {
+              // Lower confidence entry - could go either way
+              // Use 50/50 estimate (conservative)
+              exitPrice = 0.50;
+            }
+            this.log(`[PAPER] Market resolved, estimated exit: $${exitPrice.toFixed(2)}`);
+          }
+
+          const proceeds = exitPrice * position.shares;
+          const pnl = (exitPrice - position.entryPrice) * position.shares;
+
           closeTrade(position.tradeId, exitPrice, "RESOLVED");
           this.state.positions.delete(tokenId);
           this.state.balance += proceeds;
 
-          // Track consecutive wins (market resolved = win at high confidence)
+          // Track consecutive wins/losses based on actual PnL
           if (pnl > 0) {
             this.state.consecutiveWins++;
             this.state.consecutiveLosses = 0;
@@ -548,7 +634,7 @@ export class Bot {
           }
           this.checkCompoundLimit();
         } else {
-          // Real trading: cancel limit order then market sell
+          // Real trading: cancel limit order then market sell at actual price
           try {
             // Cancel the limit order if it exists
             if (position.limitOrderId) {
@@ -556,13 +642,14 @@ export class Bot {
               this.log(`Cancelled unfilled limit order`);
             }
 
+            // Market sell at actual bid price
             const result = await this.trader.marketSell(tokenId, position.shares);
             if (result) {
               closeTrade(position.tradeId, result.price, "RESOLVED");
               this.state.positions.delete(tokenId);
               const realPnl = (result.price - position.entryPrice) * position.shares;
 
-              // Track consecutive wins/losses
+              // Track consecutive wins/losses based on actual PnL
               if (realPnl > 0) {
                 this.state.consecutiveWins++;
                 this.state.consecutiveLosses = 0;
@@ -571,13 +658,16 @@ export class Bot {
                 this.state.consecutiveWins = 0;
               }
 
-              this.log(`Market resolved. PnL: $${realPnl.toFixed(2)}`);
+              this.log(`Market resolved @ $${result.price.toFixed(2)}. PnL: $${realPnl.toFixed(2)}`);
               if (this.config.riskMode === "dynamic-risk") {
                 const streakType = realPnl > 0 ? "Win" : "Loss";
                 const streakCount = realPnl > 0 ? this.state.consecutiveWins : this.state.consecutiveLosses;
                 const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
                 this.log(`[DYNAMIC] ${streakType} streak: ${streakCount} | Entry threshold: $${newThreshold.toFixed(2)}`);
               }
+
+              // Sync balance after exit
+              this.state.balance = await this.trader.getBalance();
             }
           } catch (err) {
             this.log(`Error selling expired position: ${err}`);
@@ -645,6 +735,15 @@ export class Bot {
     if (this.state.pendingExits.has(tokenId)) {
       return;
     }
+
+    // Validate position has shares
+    if (!position.shares || position.shares < 0.01) {
+      this.log(`[STOP-LOSS] Invalid position with 0 shares - removing`);
+      closeTrade(position.tradeId, 0, "RESOLVED");
+      this.state.positions.delete(tokenId);
+      return;
+    }
+
     this.state.pendingExits.add(tokenId);
 
     try {
@@ -695,6 +794,9 @@ export class Bot {
               const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
               this.log(`[DYNAMIC] Loss streak: ${this.state.consecutiveLosses} | Entry threshold now: $${newThreshold.toFixed(2)}`);
             }
+
+            // Sync balance after exit
+            this.state.balance = await this.trader.getBalance();
           }
         } catch (err) {
           this.log(`Error executing stop-loss: ${err}`);
@@ -770,6 +872,11 @@ export class Bot {
     // Skip if no balance
     if (this.state.balance < 1) return;
 
+    // Skip if balance too low for minimum order size (5 shares)
+    // Quick estimate: need at least MIN_ORDER_SIZE * askPrice USDC
+    const minUsdcNeeded = MIN_ORDER_SIZE * bestAsk;
+    if (this.state.balance < minUsdcNeeded) return;
+
     // Skip if we already have a position for this token (enterPosition also checks, but early exit is faster)
     if (this.state.positions.has(tokenId)) return;
 
@@ -800,15 +907,7 @@ export class Bot {
     if (bestAsk < activeConfig.entryThreshold || bestAsk > activeConfig.maxEntryPrice) return;
 
     // Don't buy if price is at or above profit target
-    if (bestAsk >= PROFIT_TARGET) return;
-
-    // Check opposite-side rule (only if last trade was a WIN at 99, not a stop-loss)
-    const lastTrade = getLastClosedTrade();
-    if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
-      // Only skip if previous trade sold at profit target (99) - meaning it was a win
-      // If it was a stop-loss (sold below 99), allow re-entry on same side
-      if (lastTrade.exit_price && lastTrade.exit_price >= PROFIT_TARGET) return;
-    }
+    if (bestAsk >= this.getProfitTarget()) return;
 
     // Build eligible market object for enterPosition
     const marketEndDate = market.endDate instanceof Date ? market.endDate : new Date(market.endDate);
@@ -885,8 +984,8 @@ export class Bot {
       }
 
       // Don't buy if price is already at or above profit target
-      if (askPrice >= PROFIT_TARGET) {
-        this.log(`Skipping: ask $${askPrice.toFixed(2)} >= profit target $${PROFIT_TARGET.toFixed(2)}`);
+      if (askPrice >= this.getProfitTarget()) {
+        this.log(`Skipping: ask $${askPrice.toFixed(2)} >= profit target $${this.getProfitTarget().toFixed(2)}`);
         return;
       }
 
@@ -922,18 +1021,18 @@ export class Bot {
       }
 
       // Only enter OPPOSITE side of last closed trade IN THE SAME MARKET
-      // BUT only if that trade was a WIN (sold at 99) - not a stop-loss
+      // BUT only if that trade was a WIN (positive PnL) - not a stop-loss
       // This prevents chasing the same direction after it already won
       // But allows re-entry after a stop-loss (give it another chance)
       const lastTrade = getLastClosedTrade();
       if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
-        // Only skip if previous trade sold at profit target (99) - meaning it was a win
-        if (lastTrade.exit_price && lastTrade.exit_price >= PROFIT_TARGET) {
-          this.log(`Skipping: already won ${side} at $${lastTrade.exit_price.toFixed(2)} in this market`);
+        // Check actual PnL - more reliable than comparing exit price to target
+        if (lastTrade.pnl && lastTrade.pnl > 0) {
+          this.log(`Skipping: already won ${side} with +$${lastTrade.pnl.toFixed(2)} in this market`);
           return;
         }
-        // If stopped out, allow re-entry - log for visibility
-        this.log(`Re-entering ${side} after stop-loss (prev exit: $${lastTrade.exit_price?.toFixed(2) || 'unknown'})`);
+        // If stopped out (negative PnL), allow re-entry
+        this.log(`Re-entering ${side} after loss (prev PnL: $${lastTrade.pnl?.toFixed(2) || 'unknown'})`);
       }
 
       const modeLabel = this.config.riskMode === "super-risk" ? "[SUPER-RISK] " :
@@ -951,6 +1050,13 @@ export class Bot {
 
         // Calculate shares: balance / askPrice
         const shares = balance / askPrice;
+
+        // Check minimum order size (Polymarket requires at least 5 shares)
+        if (shares < MIN_ORDER_SIZE) {
+          const minUsdc = MIN_ORDER_SIZE * askPrice;
+          this.log(`[PAPER] Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${balance.toFixed(2)})`);
+          return;
+        }
 
         // Record paper trade
         const tradeId = insertTrade({
@@ -980,12 +1086,20 @@ export class Bot {
         this.state.balance = 0;
 
         this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
-        this.log(`[PAPER] Placed limit sell @ $${PROFIT_TARGET.toFixed(2)}`);
+        this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
       } else {
         // Real trading
         const balance = await this.trader.getBalance();
         if (balance < 1) {
           this.log("Insufficient balance");
+          return;
+        }
+
+        // Check minimum order size before attempting trade
+        const estimatedShares = balance / askPrice;
+        if (estimatedShares < MIN_ORDER_SIZE) {
+          const minUsdc = MIN_ORDER_SIZE * askPrice;
+          this.log(`Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${balance.toFixed(2)})`);
           return;
         }
 
@@ -995,41 +1109,79 @@ export class Bot {
           return;
         }
 
-        // Place limit sell order at profit target
+        // Wait for order to fill (with 10s timeout)
+        this.log(`Order placed, waiting for fill...`);
+        const fillInfo = await this.trader.waitForFill(result.orderId, 10000);
+
+        if (!fillInfo || fillInfo.filledShares <= 0) {
+          // Order didn't fill - cancel it and abort
+          this.log("Order did not fill, cancelling...");
+          await this.trader.cancelOrder(result.orderId);
+          return;
+        }
+
+        // Use actual fill data instead of assumed values
+        const actualShares = fillInfo.filledShares;
+        const actualEntryPrice = fillInfo.avgPrice || askPrice;
+        const actualCost = actualShares * actualEntryPrice;
+
+        this.log(`Order filled: ${actualShares.toFixed(2)} shares @ $${actualEntryPrice.toFixed(2)}`);
+
+        // Wait for position to settle before placing limit sell
+        this.log(`Waiting for position settlement...`);
+        await new Promise(resolve => setTimeout(resolve, 3000)); // 3s initial delay
+
+        // Get ACTUAL position balance (may differ from calculated due to fees)
+        const actualPositionBalance = await this.trader.getPositionBalance(tokenId);
+        const sharesToSell = actualPositionBalance > 0 ? actualPositionBalance : actualShares;
+
+        if (Math.abs(sharesToSell - actualShares) > 0.01) {
+          this.log(`Adjusted shares: ${actualShares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
+        }
+
+        // Place limit sell order at profit target (with retry logic)
         let limitOrderId: string | undefined;
-        const limitResult = await this.trader.limitSell(tokenId, result.shares, PROFIT_TARGET);
+        const limitResult = await this.trader.limitSell(tokenId, sharesToSell, this.getProfitTarget());
         if (limitResult) {
           limitOrderId = limitResult.orderId;
-          this.log(`Placed limit sell @ $${PROFIT_TARGET.toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
+          this.log(`Placed limit sell @ $${this.getProfitTarget().toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
         } else {
           this.log("WARNING: Limit sell FAILED - position will only exit via stop-loss or expiry");
         }
 
-        // Record trade
+        // Record trade with actual position balance (accounts for fees)
         const tradeId = insertTrade({
           market_slug: market.slug,
           token_id: tokenId,
           side,
-          entry_price: askPrice,
-          shares: result.shares,
-          cost_basis: balance,
+          entry_price: actualEntryPrice,
+          shares: sharesToSell, // Use actual position balance, not calculated
+          cost_basis: actualCost,
           created_at: new Date().toISOString(),
           market_end_date: endDate.toISOString()
         });
 
+        // Recalculate dynamic stop-loss with actual entry price
+        let actualDynamicStopLoss: number | undefined;
+        if (this.config.riskMode === "dynamic-risk" && activeConfig.maxDrawdownPercent > 0) {
+          actualDynamicStopLoss = actualEntryPrice * (1 - activeConfig.maxDrawdownPercent);
+        }
+
         this.state.positions.set(tokenId, {
           tradeId,
           tokenId,
-          shares: result.shares,
-          entryPrice: askPrice,
+          shares: sharesToSell, // Use actual position balance for stop-loss
+          entryPrice: actualEntryPrice,
           side,
           marketSlug: market.slug,
           marketEndDate: endDate,
           limitOrderId,
-          dynamicStopLoss
+          dynamicStopLoss: actualDynamicStopLoss
         });
 
-        this.log(`Bought ${result.shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
+        // Sync balance after trade
+        this.state.balance = await this.trader.getBalance();
+        this.log(`Balance after trade: $${this.state.balance.toFixed(2)}`);
       }
     } finally {
       // MUTEX: Always release the lock
