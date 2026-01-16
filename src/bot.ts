@@ -593,17 +593,24 @@ export class Bot {
 
   private async subscribeToMarkets(markets: Market[]): Promise<void> {
     const tokenIds: string[] = [];
-    const marketIds: string[] = [];
+    const marketIds = new Set<string>();
     for (const market of markets) {
       if (market.clobTokenIds) {
         tokenIds.push(...market.clobTokenIds);
       }
       if (market.id) {
-        marketIds.push(market.id);
+        marketIds.add(market.id);
       }
     }
-    if (this.userStream && marketIds.length > 0) {
-      this.userStream.setMarkets([...new Set(marketIds)]);
+    if (this.userStream) {
+      for (const market of this.state.markets) {
+        if (market.id) {
+          marketIds.add(market.id);
+        }
+      }
+    }
+    if (this.userStream && marketIds.size > 0) {
+      this.userStream.setMarkets([...marketIds]);
     }
     if (tokenIds.length > 0) {
       const beforeCount = this.priceStream.getPriceCount();
