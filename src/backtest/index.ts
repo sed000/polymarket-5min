@@ -10,6 +10,8 @@ import {
   getDetailedOptimizationRanges,
   compareConfigs,
 } from "./optimizer";
+import { runGeneticOptimization } from "./genetic";
+import { printGeneticProgress, clearGeneticProgress, printGeneticReport, geneticResultToJSON, exportConfigForEnv } from "./genetic/reporter";
 import {
   printBacktestReport,
   printOptimizationTable,
@@ -42,6 +44,7 @@ COMMANDS:
   run       Run a backtest with specified configuration
   fetch     Fetch historical market data from Polymarket API
   optimize  Find optimal parameters through grid search
+  genetic   Find optimal parameters using genetic algorithm (recommended)
   compare   Compare normal vs super-risk mode
   history   View past backtest runs
   stats     Show cached data statistics
@@ -64,6 +67,13 @@ OPTIONS:
   --export <file>     Export results to file (csv or json)
   --limit <n>         Limit output rows
 
+GENETIC ALGORITHM OPTIONS:
+  --population <n>    Population size (default: 50)
+  --generations <n>   Max generations (default: 100)
+  --mutation <rate>   Mutation rate 0-1 (default: 0.15)
+  --train-split <r>   Training data ratio 0-1 (default: 0.7)
+  --elite <n>         Elite count to preserve (default: 5)
+
 EXAMPLES:
   # Run backtest with default config for last 7 days
   bun run src/backtest/index.ts run --days 7
@@ -74,8 +84,14 @@ EXAMPLES:
   # Fetch historical data
   bun run src/backtest/index.ts fetch --days 30
 
-  # Run parameter optimization
+  # Run parameter optimization (grid search)
   bun run src/backtest/index.ts optimize --days 14
+
+  # Run genetic algorithm optimization (recommended)
+  bun run src/backtest/index.ts genetic --days 14
+
+  # Run genetic with custom settings
+  bun run src/backtest/index.ts genetic --days 30 --population 100 --generations 200
 
   # Compare risk modes
   bun run src/backtest/index.ts compare --days 7
@@ -102,6 +118,12 @@ function parseArguments() {
       export: { type: "string" },
       limit: { type: "string", default: "10" },
       help: { type: "boolean", short: "h", default: false },
+      // Genetic algorithm options
+      population: { type: "string", default: "50" },
+      generations: { type: "string", default: "100" },
+      mutation: { type: "string", default: "0.15" },
+      "train-split": { type: "string", default: "0.7" },
+      elite: { type: "string", default: "5" },
     },
     allowPositionals: true,
   });
@@ -281,6 +303,72 @@ async function commandOptimize(args: ReturnType<typeof parseArguments>["values"]
   }
 }
 
+// Command: genetic
+async function commandGenetic(args: ReturnType<typeof parseArguments>["values"]) {
+  const { startDate, endDate } = getDateRange(args);
+
+  console.log("Loading historical data...");
+  let markets = await loadCachedDataset(startDate, endDate);
+
+  if (markets.length === 0) {
+    console.log("\nNo cached data found. Fetching from API...");
+    markets = await fetchHistoricalDataset(startDate, endDate, {
+      onProgress: (p) => printProgress(p.current, p.total),
+    });
+    clearProgress();
+
+    if (markets.length === 0) {
+      console.log("No historical data available for this period.");
+      return;
+    }
+  }
+
+  console.log(`\nRunning genetic optimization on ${markets.length} markets...`);
+
+  // Build GA config from args
+  const gaConfig = {
+    populationSize: parseInt(args.population || "50", 10),
+    generations: parseInt(args.generations || "100", 10),
+    mutationRate: parseFloat(args.mutation || "0.15"),
+    trainingSplit: parseFloat(args["train-split"] || "0.7"),
+    eliteCount: parseInt(args.elite || "5", 10),
+  };
+
+  console.log(`Population: ${gaConfig.populationSize}, Generations: ${gaConfig.generations}, Mutation: ${(gaConfig.mutationRate * 100).toFixed(0)}%`);
+  console.log(`Training split: ${(gaConfig.trainingSplit * 100).toFixed(0)}%, Elite: ${gaConfig.eliteCount}\n`);
+
+  const result = await runGeneticOptimization(markets, {
+    gaConfig,
+    baseConfig: {
+      startingBalance: parseFloat(args.balance || "100"),
+      startDate,
+      endDate,
+    },
+    onProgress: (p) => printGeneticProgress(p),
+  });
+
+  clearGeneticProgress();
+
+  // Print results
+  printGeneticReport(result);
+
+  // Export if requested
+  if (args.export) {
+    const ext = args.export.split(".").pop()?.toLowerCase();
+    if (ext === "json") {
+      writeFileSync(args.export, geneticResultToJSON(result));
+      console.log(`Results exported to ${args.export}`);
+    } else if (ext === "env") {
+      writeFileSync(args.export, exportConfigForEnv(result));
+      console.log(`Config exported to ${args.export}`);
+    } else {
+      // Default to JSON
+      writeFileSync(args.export, geneticResultToJSON(result));
+      console.log(`Results exported to ${args.export}`);
+    }
+  }
+}
+
 // Command: compare
 async function commandCompare(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
@@ -412,6 +500,9 @@ async function main() {
         break;
       case "optimize":
         await commandOptimize(args);
+        break;
+      case "genetic":
+        await commandGenetic(args);
         break;
       case "compare":
         await commandCompare(args);
