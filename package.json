@@ -21,6 +21,7 @@
     "backtest:run": "bun run src/backtest/index.ts run",
     "backtest:fetch": "bun run src/backtest/index.ts fetch",
     "backtest:optimize": "bun run src/backtest/index.ts optimize",
+    "backtest:genetic": "bun run src/backtest/index.ts genetic",
     "backtest:compare": "bun run src/backtest/index.ts compare",
     "backtest:history": "bun run src/backtest/index.ts history",
     "backtest:stats": "bun run src/backtest/index.ts stats"
