@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { render, Box, Text, useInput, useApp } from "ink";
-import { Bot, type BotConfig, type BotState } from "./bot";
+import { Bot, type BotConfig, type BotState, type WsStats } from "./bot";
 import { getRecentTrades, getTotalPnL, getTradeStats, type Trade } from "./db";
 import { formatTimeRemaining, type EligibleMarket } from "./scanner";
 
@@ -40,6 +40,11 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
           </Text>
+          {!state.paperTrading && (
+            <Text color={state.userWsConnected ? "cyan" : "gray"}>
+              USER
+            </Text>
+          )}
           {state.paperTrading && (
             <Text color="yellow" bold>PAPER</Text>
           )}
@@ -249,6 +254,55 @@ function Logs({ logs }: { logs: string[] }) {
   );
 }
 
+function WsPanel({ stats }: { stats: WsStats }) {
+  const formatAge = (timestamp: number): string => {
+    if (!timestamp) return "n/a";
+    const ageMs = Date.now() - timestamp;
+    if (!Number.isFinite(ageMs) || ageMs < 0) return "0s";
+    const ageSec = Math.floor(ageMs / 1000);
+    return `${ageSec}s`;
+  };
+
+  const marketAge = formatAge(stats.marketLastMessageAt);
+  const userAge = formatAge(stats.userLastMessageAt);
+  const maxAgeSec = Math.round(stats.priceMaxAgeMs / 1000);
+
+  return (
+    <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1} marginTop={1}>
+      <Text bold color="white">WebSocket Status</Text>
+      <Box marginTop={1} flexDirection="column">
+        <Box>
+          <Box width={10}><Text color="gray">Channel</Text></Box>
+          <Box width={10}><Text color="gray">Status</Text></Box>
+          <Box width={12}><Text color="gray">Last Msg</Text></Box>
+          <Box width={8}><Text color="gray">Subs</Text></Box>
+          <Box width={8}><Text color="gray">Prices</Text></Box>
+          <Box width={10}><Text color="gray">Markets</Text></Box>
+        </Box>
+        <Box>
+          <Box width={10}><Text>Market</Text></Box>
+          <Box width={10}><Text color={stats.marketConnected ? "green" : "yellow"}>{stats.marketConnected ? "ON" : "OFF"}</Text></Box>
+          <Box width={12}><Text color="cyan">{marketAge}</Text></Box>
+          <Box width={8}><Text>{stats.marketSubscriptionCount}</Text></Box>
+          <Box width={8}><Text>{stats.marketPriceCount}</Text></Box>
+          <Box width={10}><Text color="gray">-</Text></Box>
+        </Box>
+        <Box>
+          <Box width={10}><Text>User</Text></Box>
+          <Box width={10}><Text color={stats.userConnected ? "green" : "yellow"}>{stats.userConnected ? "ON" : "OFF"}</Text></Box>
+          <Box width={12}><Text color="cyan">{userAge}</Text></Box>
+          <Box width={8}><Text color="gray">-</Text></Box>
+          <Box width={8}><Text color="gray">-</Text></Box>
+          <Box width={10}><Text>{stats.userMarketCount}</Text></Box>
+        </Box>
+      </Box>
+      <Box marginTop={1}>
+        <Text color="gray">Price max age: {maxAgeSec}s</Text>
+      </Box>
+    </Box>
+  );
+}
+
 function Controls() {
   return (
     <Box marginTop={1} gap={2}>
@@ -262,11 +316,13 @@ function Controls() {
 function App({ bot }: AppProps) {
   const { exit } = useApp();
   const [state, setState] = useState<BotState>(bot.getState());
+  const [wsStats, setWsStats] = useState<WsStats>(bot.getWsStats());
   const [markets, setMarkets] = useState<EligibleMarket[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
 
   const refresh = async () => {
     setState({ ...bot.getState() });
+    setWsStats(bot.getWsStats());
     setTrades(getRecentTrades(10));
     try {
       const m = await bot.getMarketOverview();
@@ -309,6 +365,7 @@ function App({ bot }: AppProps) {
         </Box>
         <Box flexDirection="column" width="50%" marginLeft={1}>
           <TradesTable trades={trades} />
+          <WsPanel stats={wsStats} />
           <Logs logs={state.logs} />
         </Box>
       </Box>

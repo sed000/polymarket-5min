@@ -1,7 +1,7 @@
 import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, type Trade } from "./db";
-import { getPriceStream, type PriceStream } from "./websocket";
+import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
 
 // Profit targets by risk mode
 const PROFIT_TARGET_NORMAL = 0.99;      // Conservative: sell at $0.99
@@ -55,11 +55,23 @@ export interface BotState {
   tradingEnabled: boolean;
   initError: string | null;
   wsConnected: boolean;
+  userWsConnected: boolean;
   markets: Market[];
   paperTrading: boolean;
   // Dynamic-risk: loss streak tracking for dynamic entry threshold
   consecutiveLosses: number;
   consecutiveWins: number;
+}
+
+export interface WsStats {
+  marketConnected: boolean;
+  marketLastMessageAt: number;
+  marketSubscriptionCount: number;
+  marketPriceCount: number;
+  userConnected: boolean;
+  userLastMessageAt: number;
+  userMarketCount: number;
+  priceMaxAgeMs: number;
 }
 
 export type LogCallback = (message: string) => void;
@@ -71,6 +83,10 @@ export class Bot {
   private interval: Timer | null = null;
   private onLog: LogCallback;
   private priceStream: PriceStream;
+  private userStream: UserStream | null = null;
+  private wsLimitFills: Map<string, { filledShares: number; avgPrice: number }> = new Map();
+  private pendingLimitFills: Set<string> = new Set();
+  private wsPriceMaxAgeMs = 5000;
   private lastMarketRefresh: Date | null = null;
   private marketRefreshInterval = 30000; // Refresh markets every 30 seconds
 
@@ -91,6 +107,7 @@ export class Bot {
       tradingEnabled: false,
       initError: null,
       wsConnected: false,
+      userWsConnected: false,
       markets: [],
       paperTrading: config.paperTrading,
       consecutiveLosses: 0,
@@ -184,6 +201,10 @@ export class Bot {
       await this.checkEntryRealtime(update.tokenId, update.bestBid, update.bestAsk);
     });
 
+    this.priceStream.onMarketEvent((event) => {
+      this.handleMarketEvent(event);
+    });
+
     try {
       await this.priceStream.connect();
       this.state.wsConnected = true;
@@ -250,6 +271,7 @@ export class Bot {
         this.state.tradingEnabled = true;
         this.state.balance = await this.trader.getBalance();
         this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
+        await this.initUserStream();
 
         // Load open trades from DB and verify they still exist on Polymarket
         const openTrades = getOpenTrades();
@@ -304,6 +326,44 @@ export class Bot {
     }
   }
 
+  private async initUserStream(): Promise<void> {
+    if (this.config.paperTrading) return;
+
+    const creds = this.trader.getApiCreds();
+    if (!creds) {
+      this.log("User WebSocket unavailable (missing API creds)");
+      return;
+    }
+
+    this.userStream = new UserStream();
+    this.userStream.onConnectionChange((connected) => {
+      this.state.userWsConnected = connected;
+      if (connected) {
+        this.log("User WebSocket connected");
+      } else {
+        this.log("User WebSocket disconnected, will reconnect...");
+      }
+    });
+    this.userStream.onTrade((event) => {
+      this.handleUserTrade(event);
+    });
+    this.userStream.onOrder((event) => {
+      this.handleUserOrder(event);
+    });
+
+    try {
+      const marketIds = this.state.markets.map(m => m.id).filter(Boolean);
+      await this.userStream.connect({
+        apiKey: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase
+      }, marketIds);
+      this.state.userWsConnected = true;
+    } catch {
+      this.log("User WebSocket connection failed");
+    }
+  }
+
   private log(message: string): void {
     const timestamp = new Date().toLocaleTimeString();
     const formatted = `[${timestamp}] ${message}`;
@@ -312,6 +372,165 @@ export class Bot {
       this.state.logs.shift();
     }
     this.onLog(formatted);
+  }
+
+  private handleMarketEvent(event: MarketEvent): void {
+    let slug = event.slug;
+    if (!slug && event.marketId) {
+      const match = this.state.markets.find(m => m.id === event.marketId);
+      if (match) {
+        slug = match.slug;
+      }
+    }
+    if (!slug) return;
+    if (!slug.startsWith("btc-updown-15m-")) return;
+
+    const eventType = event.eventType.toLowerCase();
+    if (eventType === "market_resolved" || event.winningAssetId) {
+      const match = this.state.markets.find(m => m.slug === slug || (event.marketId && m.id === event.marketId));
+      if (match && !match.closed) {
+        match.closed = true;
+        this.log(`[WS] Market resolved: ${slug}`);
+      }
+      return;
+    }
+
+    if (eventType === "new_market") {
+      if (!event.assetsIds || event.assetsIds.length < 2) return;
+      if (this.state.markets.some(m => m.slug === slug)) return;
+
+      const match = slug.match(/btc-updown-15m-(\d+)/);
+      if (!match) return;
+
+      const startTimestamp = parseInt(match[1], 10) * 1000;
+      const endDate = new Date(startTimestamp + 15 * 60 * 1000).toISOString();
+      const outcomes = event.outcomes && event.outcomes.length >= 2 ? event.outcomes : ["Up", "Down"];
+
+      const market: Market = {
+        id: event.id || event.marketId || slug,
+        slug,
+        question: event.question || slug,
+        endDate,
+        outcomes,
+        outcomePrices: [],
+        clobTokenIds: event.assetsIds,
+        active: true,
+        closed: false
+      };
+
+      this.state.markets.push(market);
+      this.state.markets.sort((a, b) => new Date(a.endDate).getTime() - new Date(b.endDate).getTime());
+      this.log(`[WS] New BTC 15m market: ${slug}`);
+      this.subscribeToMarkets([market]).catch(() => {
+        // Ignore subscription errors
+      });
+    }
+  }
+
+  private findPositionByLimitOrderId(orderId: string): Position | null {
+    for (const position of this.state.positions.values()) {
+      if (position.limitOrderId === orderId) {
+        return position;
+      }
+    }
+    return null;
+  }
+
+  private getWsLimitFill(orderId: string, requiredShares: number): { filledShares: number; avgPrice: number } | null {
+    const fill = this.wsLimitFills.get(orderId);
+    if (!fill) return null;
+    return fill.filledShares >= requiredShares * 0.99 ? fill : null;
+  }
+
+  private recordWsLimitFill(orderId: string, matchedShares: number, price: number): void {
+    if (!orderId || !Number.isFinite(matchedShares) || !Number.isFinite(price) || matchedShares <= 0 || price <= 0) return;
+
+    const position = this.findPositionByLimitOrderId(orderId);
+    if (!position) return;
+
+    const existing = this.wsLimitFills.get(orderId);
+    const prevShares = existing?.filledShares || 0;
+    const totalShares = prevShares + matchedShares;
+    const avgPrice = existing
+      ? (existing.avgPrice * prevShares + price * matchedShares) / totalShares
+      : price;
+
+    this.wsLimitFills.set(orderId, { filledShares: totalShares, avgPrice });
+
+    if (totalShares >= position.shares * 0.99) {
+      this.wsLimitFills.delete(orderId);
+      this.processLimitFill(position, avgPrice, "WS").catch(() => {
+        // Ignore fill handling errors
+      });
+    }
+  }
+
+  private async processLimitFill(position: Position, exitPrice: number, source: "WS" | "REST"): Promise<void> {
+    if (this.pendingLimitFills.has(position.tokenId)) return;
+    const current = this.state.positions.get(position.tokenId);
+    if (!current) return;
+
+    this.pendingLimitFills.add(position.tokenId);
+    try {
+      const pnl = (exitPrice - current.entryPrice) * current.shares;
+      closeTrade(current.tradeId, exitPrice, "RESOLVED");
+      this.state.positions.delete(position.tokenId);
+      if (current.limitOrderId) {
+        this.wsLimitFills.delete(current.limitOrderId);
+      }
+
+      this.state.consecutiveWins++;
+      this.state.consecutiveLosses = 0;
+
+      this.log(`[${source}] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+      if (this.config.riskMode === "dynamic-risk") {
+        this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
+      }
+      this.state.balance = await this.trader.getBalance();
+    } finally {
+      this.pendingLimitFills.delete(position.tokenId);
+    }
+  }
+
+  private handleUserTrade(event: UserTradeEvent): void {
+    if (this.config.paperTrading) return;
+
+    if (Array.isArray(event.maker_orders)) {
+      for (const maker of event.maker_orders) {
+        const orderId = maker.order_id;
+        const matchedShares = parseFloat(maker.matched_amount || "0");
+        const price = parseFloat(maker.price || event.price || "0");
+        this.recordWsLimitFill(orderId || "", matchedShares, price);
+      }
+    }
+
+    if (event.taker_order_id) {
+      const matchedShares = parseFloat(event.size || "0");
+      const price = parseFloat(event.price || "0");
+      this.recordWsLimitFill(event.taker_order_id, matchedShares, price);
+    }
+  }
+
+  private handleUserOrder(event: UserOrderEvent): void {
+    if (this.config.paperTrading) return;
+
+    const orderId = event.id;
+    if (!orderId) return;
+
+    const position = this.findPositionByLimitOrderId(orderId);
+    if (!position) return;
+
+    const sizeMatched = parseFloat(event.size_matched || "0");
+    const originalSize = parseFloat(event.original_size || "0");
+    const status = (event.status || "").toUpperCase();
+    const filled = status === "MATCHED" || (originalSize > 0 && sizeMatched >= originalSize);
+
+    if (filled) {
+      const price = parseFloat(event.price || "0") || this.getProfitTarget();
+      this.processLimitFill(position, price, "WS").catch(() => {
+        // Ignore fill handling errors
+      });
+    }
   }
 
   /**
@@ -374,10 +593,24 @@ export class Bot {
 
   private async subscribeToMarkets(markets: Market[]): Promise<void> {
     const tokenIds: string[] = [];
+    const marketIds = new Set<string>();
     for (const market of markets) {
       if (market.clobTokenIds) {
         tokenIds.push(...market.clobTokenIds);
       }
+      if (market.id) {
+        marketIds.add(market.id);
+      }
+    }
+    if (this.userStream) {
+      for (const market of this.state.markets) {
+        if (market.id) {
+          marketIds.add(market.id);
+        }
+      }
+    }
+    if (this.userStream && marketIds.size > 0) {
+      this.userStream.setMarkets([...marketIds]);
     }
     if (tokenIds.length > 0) {
       const beforeCount = this.priceStream.getPriceCount();
@@ -411,7 +644,7 @@ export class Bot {
     const overrides: PriceOverride = {};
     for (const market of this.state.markets) {
       for (const tokenId of market.clobTokenIds) {
-        const wsPrice = this.priceStream.getPrice(tokenId);
+        const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
         if (wsPrice) {
           overrides[tokenId] = {
             bestBid: wsPrice.bestBid,
@@ -483,7 +716,7 @@ export class Bot {
       try {
         if (this.config.paperTrading) {
           // Paper trading: check if price hit profit target
-          const wsPrice = this.priceStream.getPrice(tokenId);
+          const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
             // Simulate limit order fill at profit target
             const exitPrice = this.getProfitTarget();
@@ -508,23 +741,17 @@ export class Bot {
         } else {
           // Real trading: check if limit order exists and is filled
           if (position.limitOrderId) {
+            const wsFill = this.getWsLimitFill(position.limitOrderId, position.shares);
+            if (wsFill) {
+              await this.processLimitFill(position, wsFill.avgPrice, "WS");
+              continue;
+            }
+
             const fillInfo = await this.trader.getOrderFillInfo(position.limitOrderId);
             if (fillInfo && fillInfo.filled) {
               // Use ACTUAL fill price from the order, not assumed target
               const actualExitPrice = fillInfo.avgPrice > 0 ? fillInfo.avgPrice : this.getProfitTarget();
-              const pnl = (actualExitPrice - position.entryPrice) * position.shares;
-
-              closeTrade(position.tradeId, actualExitPrice, "RESOLVED");
-              this.state.positions.delete(tokenId);
-
-              this.state.consecutiveWins++;
-              this.state.consecutiveLosses = 0;
-
-              this.log(`Limit order filled @ $${actualExitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-              if (this.config.riskMode === "dynamic-risk") {
-                this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
-              }
-              this.state.balance = await this.trader.getBalance();
+              await this.processLimitFill(position, actualExitPrice, "REST");
               continue;
             }
           }
@@ -538,7 +765,7 @@ export class Bot {
           }
 
           // No limit order OR not filled yet - check if price hit target and sell manually
-          const wsPrice = this.priceStream.getPrice(tokenId);
+          const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
             this.log(`Price hit profit target $${wsPrice.bestBid.toFixed(2)} - selling manually`);
 
@@ -587,7 +814,7 @@ export class Bot {
         if (this.config.paperTrading) {
           // Paper trading: Get actual price from WebSocket or estimate from market resolution
           let exitPrice: number;
-          const wsPrice = this.priceStream.getPrice(tokenId);
+          const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
 
           if (wsPrice && wsPrice.bestBid > 0) {
             // Use actual market price if available
@@ -816,7 +1043,7 @@ export class Bot {
       try {
         // Use WebSocket price if available, otherwise fall back to REST API
         let currentBid: number;
-        const wsPrice = this.priceStream.getPrice(tokenId);
+        const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
         if (wsPrice && this.state.wsConnected) {
           currentBid = wsPrice.bestBid;
         } else if (!this.config.paperTrading) {
@@ -1195,6 +1422,19 @@ export class Bot {
 
   getConfig(): BotConfig {
     return this.config;
+  }
+
+  getWsStats(): WsStats {
+    return {
+      marketConnected: this.state.wsConnected,
+      marketLastMessageAt: this.priceStream.getLastMessageAt(),
+      marketSubscriptionCount: this.priceStream.getSubscriptionCount(),
+      marketPriceCount: this.priceStream.getPriceCount(),
+      userConnected: this.state.userWsConnected,
+      userLastMessageAt: this.userStream ? this.userStream.getLastMessageAt() : 0,
+      userMarketCount: this.userStream ? this.userStream.getMarketCount() : 0,
+      priceMaxAgeMs: this.wsPriceMaxAgeMs
+    };
   }
 
   async getMarketOverview(): Promise<EligibleMarket[]> {
