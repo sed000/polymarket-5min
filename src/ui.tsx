@@ -22,7 +22,6 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
   const activeEntry = isDynamicRisk ? dynamicThreshold : isSuperRisk ? 0.70 : config.entryThreshold;
   const activeMaxEntry = isDynamicRisk ? 0.95 : isSuperRisk ? 0.95 : config.maxEntryPrice;
   const activeStop = isDynamicRisk ? "dynamic" : isSuperRisk ? 0.40 : config.stopLoss;
-  const activeDelay = isDynamicRisk ? 2000 : isSuperRisk ? 0 : config.stopLossDelayMs;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
@@ -68,7 +67,6 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
         )}
         <Text>Entry: <Text color={isDynamicRisk ? "blue" : isSuperRisk ? "magenta" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
         <Text>Stop: <Text color="red">{isDynamicRisk ? "32.5%" : `≤$${activeStop.toFixed(2)}`}</Text></Text>
-        {activeDelay > 0 && <Text>Delay: <Text color="cyan">{activeDelay / 1000}s</Text></Text>}
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
         {isDynamicRisk && (
           <Text>

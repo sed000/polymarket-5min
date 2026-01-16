@@ -55,7 +55,6 @@ export function printGeneticReport(result: GeneticOptimizationResult): void {
   console.log(`  Entry Threshold:     $${genes.entryThreshold.toFixed(2)}`);
   console.log(`  Max Entry Price:     $${genes.maxEntryPrice.toFixed(2)}`);
   console.log(`  Stop Loss:           $${genes.stopLoss.toFixed(2)}`);
-  console.log(`  Stop Loss Delay:     ${genes.stopLossDelayMs}ms`);
   console.log(`  Max Spread:          $${genes.maxSpread.toFixed(3)}`);
   console.log(`  Time Window:         ${(genes.timeWindowMs / 60000).toFixed(1)} min`);
   console.log(`  Profit Target:       $${genes.profitTarget.toFixed(2)}`);
@@ -113,8 +112,8 @@ function printMetricsSummary(m: PerformanceMetrics): void {
  * Print top strategies table
  */
 function printTopStrategies(strategies: Chromosome[]): void {
-  console.log("  Rank | Entry  | MaxEntry | Stop   | Delay   | ValPnL   | ValWin% | TrainPnL");
-  console.log("  -----+--------+----------+--------+---------+----------+---------+---------");
+  console.log("  Rank | Entry  | MaxEntry | Stop   | ValPnL   | ValWin% | TrainPnL");
+  console.log("  -----+--------+----------+--------+----------+---------+---------");
 
   strategies.forEach((s, i) => {
     const valPnL = s.validationMetrics?.totalPnL ?? 0;
@@ -126,7 +125,6 @@ function printTopStrategies(strategies: Chromosome[]): void {
       `$${s.genes.entryThreshold.toFixed(2)} | ` +
       `$${s.genes.maxEntryPrice.toFixed(2)}   | ` +
       `$${s.genes.stopLoss.toFixed(2)} | ` +
-      `${s.genes.stopLossDelayMs.toString().padStart(5)}ms | ` +
       `$${valPnL.toFixed(2).padStart(7)} | ` +
       `${(valWin * 100).toFixed(0).padStart(5)}% | ` +
       `$${trainPnL.toFixed(2).padStart(7)}`
@@ -229,7 +227,6 @@ export function exportConfigForEnv(result: GeneticOptimizationResult): string {
     `BACKTEST_ENTRY_THRESHOLD=${genes.entryThreshold}`,
     `BACKTEST_MAX_ENTRY_PRICE=${genes.maxEntryPrice}`,
     `BACKTEST_STOP_LOSS=${genes.stopLoss}`,
-    `BACKTEST_STOP_LOSS_DELAY_MS=${genes.stopLossDelayMs}`,
     `BACKTEST_MAX_SPREAD=${genes.maxSpread}`,
     `BACKTEST_TIME_WINDOW_MINS=${Math.round(genes.timeWindowMs / 60000)}`,
     `BACKTEST_PROFIT_TARGET=${genes.profitTarget}`,

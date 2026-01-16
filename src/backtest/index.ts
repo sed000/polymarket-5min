@@ -57,7 +57,6 @@ OPTIONS:
   --entry <price>     Entry threshold (default: 0.95)
   --max-entry <price> Max entry price (default: 0.98)
   --stop <price>      Stop loss threshold (default: 0.80)
-  --delay <ms>        Stop loss delay in ms (default: 5000)
   --spread <price>    Max spread (default: 0.03)
   --window <ms>       Time window in ms (default: 300000)
   --balance <amount>  Starting balance (default: 100)
@@ -139,7 +138,6 @@ function getEnvConfig() {
     maxEntryPrice: parseFloat(process.env.BACKTEST_MAX_ENTRY_PRICE || "0.98"),
     stopLoss: parseFloat(process.env.BACKTEST_STOP_LOSS || "0.80"),
     profitTarget: parseFloat(process.env.BACKTEST_PROFIT_TARGET || "0.99"),
-    stopLossDelayMs: parseInt(process.env.BACKTEST_STOP_LOSS_DELAY_MS || "5000", 10),
     maxSpread: parseFloat(process.env.BACKTEST_MAX_SPREAD || "0.03"),
     timeWindowMs: parseInt(process.env.BACKTEST_TIME_WINDOW_MINS || "5", 10) * 60 * 1000,
     startingBalance: parseFloat(process.env.BACKTEST_STARTING_BALANCE || "100"),
@@ -169,7 +167,6 @@ function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDat
     entryThreshold: args.entry ? parseFloat(args.entry) : envConfig.entryThreshold,
     maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : envConfig.maxEntryPrice,
     stopLoss: args.stop ? parseFloat(args.stop) : envConfig.stopLoss,
-    stopLossDelayMs: args.delay ? parseInt(args.delay, 10) : envConfig.stopLossDelayMs,
     maxSpread: args.spread ? parseFloat(args.spread) : envConfig.maxSpread,
     timeWindowMs: args.window ? parseInt(args.window, 10) : envConfig.timeWindowMs,
     profitTarget: envConfig.profitTarget,

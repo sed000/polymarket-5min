@@ -13,7 +13,6 @@ export interface BotConfig {
   entryThreshold: number;  // e.g., 0.95
   maxEntryPrice: number;   // e.g., 0.98 - avoid ceiling price
   stopLoss: number;        // e.g., 0.80
-  stopLossDelayMs: number; // e.g., 5000 - confirmation delay in ms
   maxSpread: number;       // e.g., 0.03 - max bid-ask spread
   timeWindowMs: number;    // e.g., 5 * 60 * 1000
   pollIntervalMs: number;  // e.g., 10 * 1000
@@ -36,10 +35,6 @@ export interface Position {
   marketSlug: string;
   marketEndDate: Date;
   limitOrderId?: string; // Limit sell order at $0.99
-  pendingStopLoss?: {
-    triggeredAt: number;  // Timestamp when stop-loss first triggered
-    triggeredPrice: number;
-  };
   dynamicStopLoss?: number; // Dynamic-risk: entry-relative stop-loss (entryPrice * 0.675)
 }
 
@@ -137,7 +132,6 @@ export class Bot {
         maxEntryPrice: 0.95,
         stopLoss: 0.40,
         timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
-        stopLossDelayMs: 0,  // No delay for super-risk - immediate stop-loss
         maxSpread: 0.05,  // Allow wider spreads for volatile entries
         maxDrawdownPercent: 0  // Not used in super-risk (uses fixed stopLoss)
       };
@@ -154,7 +148,6 @@ export class Bot {
         maxEntryPrice: 0.95,
         stopLoss: 0.40,  // Fallback only - we use dynamic per-position stop
         timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
-        stopLossDelayMs: 2000,  // 2s confirmation delay to filter whipsaws
         maxSpread: 0.05,
         maxDrawdownPercent: 0.325  // 32.5% max loss per trade (dynamic stop-loss)
       };
@@ -164,7 +157,6 @@ export class Bot {
       maxEntryPrice: this.config.maxEntryPrice,
       stopLoss: this.config.stopLoss,
       timeWindowMs: this.config.timeWindowMs,
-      stopLossDelayMs: this.config.stopLossDelayMs,
       maxSpread: this.config.maxSpread,
       maxDrawdownPercent: 0  // Not used in normal mode
     };
@@ -915,42 +907,14 @@ export class Bot {
     const position = this.state.positions.get(tokenId);
     if (!position) return;
 
-    const now = Date.now();
     const activeConfig = this.getActiveConfig();
 
     // Use dynamic stop-loss if available (dynamic-risk), otherwise use fixed config
     const effectiveStopLoss = position.dynamicStopLoss || activeConfig.stopLoss;
 
-    // Check if price is below stop-loss threshold
+    // Check if price is below stop-loss threshold - execute immediately
     if (currentBid <= effectiveStopLoss) {
-      // First time triggering? Start the timer
-      if (!position.pendingStopLoss) {
-        position.pendingStopLoss = {
-          triggeredAt: now,
-          triggeredPrice: currentBid
-        };
-        const delaySec = activeConfig.stopLossDelayMs / 1000;
-        if (delaySec > 0) {
-          this.log(`[WS] Stop-loss pending for ${position.side} @ $${currentBid.toFixed(2)} (${delaySec}s confirm)`);
-        } else {
-          // No delay - execute immediately (await to prevent race conditions)
-          await this.executeStopLoss(tokenId, position, currentBid);
-        }
-        return;
-      }
-
-      // Check if delay has passed
-      const elapsed = now - position.pendingStopLoss.triggeredAt;
-      if (elapsed >= activeConfig.stopLossDelayMs) {
-        // Confirmed - execute stop-loss (await to prevent race conditions)
-        await this.executeStopLoss(tokenId, position, currentBid);
-      }
-    } else {
-      // Price recovered - cancel pending stop-loss
-      if (position.pendingStopLoss) {
-        this.log(`[WS] Stop-loss cancelled for ${position.side} - price recovered to $${currentBid.toFixed(2)}`);
-        position.pendingStopLoss = undefined;
-      }
+      await this.executeStopLoss(tokenId, position, currentBid);
     }
   }
 
@@ -974,11 +938,7 @@ export class Bot {
     this.state.pendingExits.add(tokenId);
 
     try {
-      const elapsed = position.pendingStopLoss
-        ? (Date.now() - position.pendingStopLoss.triggeredAt) / 1000
-        : 0;
-
-      this.log(`[WS] Stop-loss TRIGGERED for ${position.side} @ $${currentBid.toFixed(2)} (held ${elapsed.toFixed(1)}s)`);
+      this.log(`[WS] Stop-loss TRIGGERED for ${position.side} @ $${currentBid.toFixed(2)}`);
 
       if (this.config.paperTrading) {
         // Paper trading: simulate sell at bid price
@@ -1036,7 +996,6 @@ export class Bot {
   }
 
   private async checkStopLosses(): Promise<void> {
-    const now = Date.now();
     const activeConfig = this.getActiveConfig();
 
     for (const [tokenId, position] of this.state.positions) {
@@ -1056,31 +1015,9 @@ export class Bot {
         // Use dynamic stop-loss if available (dynamic-risk), otherwise use fixed config
         const effectiveStopLoss = position.dynamicStopLoss || activeConfig.stopLoss;
 
-        // Check if price is below stop-loss threshold
+        // Check if price is below stop-loss threshold - execute immediately
         if (currentBid <= effectiveStopLoss) {
-          // First time triggering? Start the timer
-          if (!position.pendingStopLoss) {
-            position.pendingStopLoss = {
-              triggeredAt: now,
-              triggeredPrice: currentBid
-            };
-            const delaySec = activeConfig.stopLossDelayMs / 1000;
-            this.log(`Stop-loss pending for ${position.side} @ $${currentBid.toFixed(2)} (${delaySec}s confirm)`);
-            continue;
-          }
-
-          // Check if delay has passed
-          const elapsed = now - position.pendingStopLoss.triggeredAt;
-          if (elapsed >= activeConfig.stopLossDelayMs) {
-            // Confirmed - execute stop-loss
-            await this.executeStopLoss(tokenId, position, currentBid);
-          }
-        } else {
-          // Price recovered - cancel pending stop-loss
-          if (position.pendingStopLoss) {
-            this.log(`Stop-loss cancelled for ${position.side} - price recovered to $${currentBid.toFixed(2)}`);
-            position.pendingStopLoss = undefined;
-          }
+          await this.executeStopLoss(tokenId, position, currentBid);
         }
       } catch (err) {
         this.log(`Error checking stop-loss: ${err}`);

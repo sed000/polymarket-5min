@@ -9,7 +9,6 @@ This document explains the three trading modes available in the Polymarket BTC 1
 | Entry Threshold | User-defined (e.g. $0.95) | Fixed $0.70 | Adaptive $0.70–$0.85 |
 | Max Entry Price | User-defined (e.g. $0.98) | $0.95 | $0.95 |
 | Stop-Loss | User-defined (e.g. $0.80) | Fixed $0.40 | Entry-relative (32.5% drawdown) |
-| Stop-Loss Delay | User-defined | 0ms (immediate) | 2000ms (confirmation) |
 | Max Spread | User-defined | $0.05 | $0.05 |
 | Profit Target | $0.99 | $0.98 | $0.98 |
 | Time Window | User-defined | Full 15 min | Full 15 min |
@@ -24,14 +23,13 @@ This document explains the three trading modes available in the Polymarket BTC 1
 - Wait for high-confidence entries (e.g., price already at $0.95+)
 - Tight stop-loss to protect capital
 - Sell at $0.99 for maximum profit per trade
-- Configurable confirmation delay to filter noise
+- Immediate stop-loss execution when price drops below threshold
 
 ### Parameters
 ```
 entryThreshold:  User-defined (ENTRY_THRESHOLD env var)
 maxEntryPrice:   User-defined (MAX_ENTRY_PRICE env var)
 stopLoss:        User-defined (STOP_LOSS env var)
-stopLossDelayMs: User-defined (STOP_LOSS_DELAY_MS env var)
 maxSpread:       User-defined (MAX_SPREAD env var)
 profitTarget:    $0.99 (fixed)
 ```
@@ -58,7 +56,6 @@ profitTarget:    $0.99 (fixed)
 entryThreshold:  $0.70 (fixed)
 maxEntryPrice:   $0.95 (fixed)
 stopLoss:        $0.40 (fixed)
-stopLossDelayMs: 0ms (immediate execution)
 maxSpread:       $0.05 (fixed)
 profitTarget:    $0.98 (fixed)
 timeWindow:      Full 15 minutes
@@ -83,7 +80,6 @@ timeWindow:      Full 15 minutes
 ### Strategy
 - **Adaptive entry threshold:** Starts at $0.70, increases $0.05 per consecutive loss (caps at $0.85)
 - **Entry-relative stop-loss:** 32.5% max drawdown from entry price (not a fixed level)
-- **Whipsaw filter:** 2-second confirmation delay before executing stop-loss
 - **Spread adjustment:** Wide spreads (>50% of max) require $0.03 higher entry
 
 ### Parameters
@@ -91,7 +87,6 @@ timeWindow:      Full 15 minutes
 entryThreshold:     $0.70 base + ($0.05 × consecutiveLosses), max $0.85
 maxEntryPrice:      $0.95 (fixed)
 stopLoss:           entryPrice × 0.675 (32.5% below entry)
-stopLossDelayMs:    2000ms (2 second confirmation)
 maxSpread:          $0.05 (fixed)
 profitTarget:       $0.98 (fixed)
 timeWindow:         Full 15 minutes
@@ -118,16 +113,6 @@ When a trade wins, the threshold resets to $0.70.
 | $0.80 | $0.54 |
 | $0.85 | $0.5738 |
 
-### Why 2-Second Stop-Loss Delay?
-
-The delay filters **whipsaws**—brief price dips that quickly recover:
-
-1. Price drops below stop-loss → timer starts
-2. If price **stays below** for 2 seconds → stop-loss executes
-3. If price **recovers** within 2 seconds → stop-loss cancelled
-
-This prevents getting stopped out on temporary volatility spikes that would have recovered, improving overall win rate at the cost of slightly larger losses when stops are legitimately hit.
-
 ### Spread-Based Threshold Adjustment
 
 When spread exceeds 50% of max ($0.025):
@@ -139,7 +124,7 @@ Example: If base threshold is $0.75 and spread is $0.03 (>$0.025), effective thr
 ### When to Use
 - You want the bot to self-adjust during losing streaks
 - You prefer position-relative risk management
-- You want protection against whipsaw stop-outs
+- You want adaptive entry thresholds based on recent performance
 
 ---
 

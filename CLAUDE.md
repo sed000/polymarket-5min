@@ -48,7 +48,7 @@ bun run backtest:history  # View historical runs
 - Position management with mutex-protected entry/exit to prevent race conditions
 - Three risk modes: "normal" (conservative), "super-risk" (aggressive), and "dynamic-risk" (adaptive)
 - Real-time price monitoring via WebSocket with fallback to REST API
-- Stop-loss with configurable confirmation delay
+- Immediate stop-loss execution when price drops below threshold
 - Profit target limit orders at $0.99
 - Compound limit system (take profit when balance exceeds threshold)
 - Paper trading simulation with virtual balance
@@ -86,14 +86,13 @@ Environment variables control trading behavior (see `.env.example`):
 - `ENTRY_THRESHOLD` - Minimum price to enter (e.g., 0.95)
 - `MAX_ENTRY_PRICE` - Maximum price to enter (e.g., 0.98)
 - `STOP_LOSS` - Exit trigger price (e.g., 0.80)
-- `STOP_LOSS_DELAY_MS` - Confirmation delay before stop-loss
 - `COMPOUND_LIMIT` / `BASE_BALANCE` - Profit taking system
 - `SIGNATURE_TYPE` - 0=EOA, 1=Magic.link proxy, 2=Gnosis Safe
 
 ### Backtest-Specific Variables
 - `BACKTEST_MODE` - Risk mode for backtesting
 - `BACKTEST_ENTRY_THRESHOLD` / `BACKTEST_MAX_ENTRY_PRICE` - Entry prices
-- `BACKTEST_STOP_LOSS` / `BACKTEST_STOP_LOSS_DELAY_MS` - Stop-loss config
+- `BACKTEST_STOP_LOSS` - Stop-loss threshold
 - `BACKTEST_PROFIT_TARGET` - Target exit price (default: 0.98)
 - `BACKTEST_MAX_SPREAD` / `BACKTEST_TIME_WINDOW_MINS` - Filters
 - `BACKTEST_STARTING_BALANCE` / `BACKTEST_DAYS` - Simulation settings
@@ -110,4 +109,3 @@ Environment variables control trading behavior (see `.env.example`):
 - **Position-relative stop-loss**: 32.5% max drawdown per trade (calculated from entry price)
 - **Loss streak tracking**: `consecutiveLosses` / `consecutiveWins` in BotState
 - **Recovery behavior**: Win streak resets threshold to base, preventing "revenge trading"
-- **Stop-loss delay**: 2 seconds (vs 0ms for super-risk)

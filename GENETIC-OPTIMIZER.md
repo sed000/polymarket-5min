@@ -60,7 +60,6 @@ bun run backtest:genetic --days 14 --export config.env
 | Entry Threshold | $0.70 - $0.96 | Minimum price to buy |
 | Max Entry Price | $0.92 - $0.99 | Maximum price to buy |
 | Stop Loss | $0.30 - $0.80 | Exit if price drops below |
-| Stop Loss Delay | 0 - 10000ms | Wait before executing stop |
 | Max Spread | $0.02 - $0.08 | Max bid-ask spread allowed |
 | Time Window | 1 - 15 min | How close to market end to trade |
 | Profit Target | $0.98 - $0.99 | Take profit price |
@@ -72,7 +71,6 @@ bun run backtest:genetic --days 14 --export config.env
   Entry Threshold:     $0.96    <- Only buy when price is >= $0.96
   Max Entry Price:     $0.97    <- Don't buy if price > $0.97
   Stop Loss:           $0.37    <- Sell if price drops to $0.37
-  Stop Loss Delay:     5546ms   <- Wait 5.5s before stop loss
   Max Spread:          $0.080   <- Allow up to 8 cent spread
   Time Window:         1.8 min  <- Enter within 1.8 min of market end
   Profit Target:       $0.99    <- Take profit at $0.99
@@ -100,7 +98,6 @@ bun run backtest:run --days 14 \
   --entry 0.96 \
   --max-entry 0.97 \
   --stop 0.37 \
-  --delay 5546 \
   --spread 0.08 \
   --window 108000 \
   --balance 10
@@ -112,7 +109,6 @@ Or set them in your `.env` file:
 BACKTEST_ENTRY_THRESHOLD=0.96
 BACKTEST_MAX_ENTRY_PRICE=0.97
 BACKTEST_STOP_LOSS=0.37
-BACKTEST_STOP_LOSS_DELAY_MS=5546
 BACKTEST_MAX_SPREAD=0.08
 BACKTEST_TIME_WINDOW_MINS=2
 BACKTEST_PROFIT_TARGET=0.99

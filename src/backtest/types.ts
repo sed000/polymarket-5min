@@ -6,7 +6,6 @@ export interface BacktestConfig {
   entryThreshold: number;
   maxEntryPrice: number;
   stopLoss: number;
-  stopLossDelayMs: number;
   maxSpread: number;
   timeWindowMs: number;
   profitTarget: number;
@@ -30,7 +29,6 @@ export interface OptimizationRanges {
   entryThreshold?: { min: number; max: number; step: number };
   maxEntryPrice?: { min: number; max: number; step: number };
   stopLoss?: { min: number; max: number; step: number };
-  stopLossDelayMs?: { min: number; max: number; step: number };
   maxSpread?: { min: number; max: number; step: number };
   timeWindowMs?: { min: number; max: number; step: number };
 }
@@ -65,10 +63,6 @@ export interface SimulatedPosition {
   shares: number;
   entryPrice: number;
   entryTimestamp: number;
-  pendingStopLoss?: {
-    triggeredAt: number;
-    triggeredPrice: number;
-  };
 }
 
 // Exit reasons
@@ -182,7 +176,6 @@ export const DEFAULT_OPTIMIZATION_RANGES: OptimizationRanges = {
   entryThreshold: { min: 0.70, max: 0.96, step: 0.02 },
   maxEntryPrice: { min: 0.92, max: 0.99, step: 0.01 },
   stopLoss: { min: 0.30, max: 0.80, step: 0.05 },
-  stopLossDelayMs: { min: 0, max: 10000, step: 2000 },
   maxSpread: { min: 0.02, max: 0.08, step: 0.02 },
   timeWindowMs: { min: 60000, max: 900000, step: 120000 }, // 1-15 minutes
 };
@@ -192,7 +185,6 @@ export const DEFAULT_BACKTEST_CONFIG: Omit<BacktestConfig, "startDate" | "endDat
   entryThreshold: 0.95,
   maxEntryPrice: 0.98,
   stopLoss: 0.80,
-  stopLossDelayMs: 5000,
   maxSpread: 0.03,
   timeWindowMs: 5 * 60 * 1000,
   profitTarget: 0.99,
@@ -208,7 +200,6 @@ export const SUPER_RISK_CONFIG: Partial<BacktestConfig> = {
   entryThreshold: 0.70,
   maxEntryPrice: 0.95,
   stopLoss: 0.40,
-  stopLossDelayMs: 0,
   maxSpread: 0.05,
   timeWindowMs: 15 * 60 * 1000,
   riskMode: "super-risk",

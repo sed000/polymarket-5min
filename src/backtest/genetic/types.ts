@@ -5,7 +5,6 @@ export interface ParameterBounds {
   entryThreshold: { min: number; max: number };
   maxEntryPrice: { min: number; max: number };
   stopLoss: { min: number; max: number };
-  stopLossDelayMs: { min: number; max: number };
   maxSpread: { min: number; max: number };
   timeWindowMs: { min: number; max: number };
   profitTarget: { min: number; max: number };
@@ -16,7 +15,6 @@ export interface Genes {
   entryThreshold: number;
   maxEntryPrice: number;
   stopLoss: number;
-  stopLossDelayMs: number;
   maxSpread: number;
   timeWindowMs: number;
   profitTarget: number;
@@ -97,7 +95,6 @@ export const DEFAULT_BOUNDS: ParameterBounds = {
   entryThreshold: { min: 0.70, max: 0.96 },
   maxEntryPrice: { min: 0.92, max: 0.99 },
   stopLoss: { min: 0.30, max: 0.80 },
-  stopLossDelayMs: { min: 0, max: 10000 },
   maxSpread: { min: 0.02, max: 0.08 },
   timeWindowMs: { min: 60000, max: 900000 },
   profitTarget: { min: 0.98, max: 0.99 },

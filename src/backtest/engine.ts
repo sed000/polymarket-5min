@@ -150,40 +150,16 @@ export class BacktestEngine {
   }
 
   /**
-   * Check stop-loss conditions with delay confirmation
+   * Check stop-loss conditions - execute immediately if triggered
    */
   private checkStopLoss(tick: PriceTick): void {
     if (!this.position) return;
 
     const currentBid = tick.bestBid;
 
-    // Check if price is below stop-loss threshold
+    // Check if price is below stop-loss threshold - execute immediately
     if (currentBid <= this.config.stopLoss) {
-      // First time triggering? Start the timer
-      if (!this.position.pendingStopLoss) {
-        this.position.pendingStopLoss = {
-          triggeredAt: tick.timestamp,
-          triggeredPrice: currentBid,
-        };
-
-        // If no delay configured, execute immediately
-        if (this.config.stopLossDelayMs === 0) {
-          this.executeExit(currentBid, tick.timestamp, "STOP_LOSS");
-        }
-        return;
-      }
-
-      // Check if delay has passed
-      const elapsed = tick.timestamp - this.position.pendingStopLoss.triggeredAt;
-      if (elapsed >= this.config.stopLossDelayMs) {
-        // Confirmed - execute stop-loss
-        this.executeExit(currentBid, tick.timestamp, "STOP_LOSS");
-      }
-    } else {
-      // Price recovered - cancel pending stop-loss
-      if (this.position.pendingStopLoss) {
-        this.position.pendingStopLoss = undefined;
-      }
+      this.executeExit(currentBid, tick.timestamp, "STOP_LOSS");
     }
   }
 

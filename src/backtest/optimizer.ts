@@ -49,10 +49,6 @@ export function generateParameterCombinations(
     ? generateValues(ranges.stopLoss)
     : [baseConfig.stopLoss ?? DEFAULT_BACKTEST_CONFIG.stopLoss];
 
-  const stopLossDelays = ranges.stopLossDelayMs
-    ? generateValues(ranges.stopLossDelayMs)
-    : [baseConfig.stopLossDelayMs ?? DEFAULT_BACKTEST_CONFIG.stopLossDelayMs];
-
   const maxSpreads = ranges.maxSpread
     ? generateValues(ranges.maxSpread)
     : [baseConfig.maxSpread ?? DEFAULT_BACKTEST_CONFIG.maxSpread];
@@ -71,19 +67,16 @@ export function generateParameterCombinations(
         // Skip invalid combinations where stop loss > entry threshold
         if (stopLoss >= entryThreshold) continue;
 
-        for (const stopLossDelayMs of stopLossDelays) {
-          for (const maxSpread of maxSpreads) {
-            for (const timeWindowMs of timeWindows) {
-              combinations.push({
-                ...baseConfig,
-                entryThreshold,
-                maxEntryPrice,
-                stopLoss,
-                stopLossDelayMs,
-                maxSpread,
-                timeWindowMs,
-              });
-            }
+        for (const maxSpread of maxSpreads) {
+          for (const timeWindowMs of timeWindows) {
+            combinations.push({
+              ...baseConfig,
+              entryThreshold,
+              maxEntryPrice,
+              stopLoss,
+              maxSpread,
+              timeWindowMs,
+            });
           }
         }
       }
@@ -129,7 +122,6 @@ export async function runOptimization(
       entryThreshold: params.entryThreshold ?? DEFAULT_BACKTEST_CONFIG.entryThreshold,
       maxEntryPrice: params.maxEntryPrice ?? DEFAULT_BACKTEST_CONFIG.maxEntryPrice,
       stopLoss: params.stopLoss ?? DEFAULT_BACKTEST_CONFIG.stopLoss,
-      stopLossDelayMs: params.stopLossDelayMs ?? DEFAULT_BACKTEST_CONFIG.stopLossDelayMs,
       maxSpread: params.maxSpread ?? DEFAULT_BACKTEST_CONFIG.maxSpread,
       timeWindowMs: params.timeWindowMs ?? DEFAULT_BACKTEST_CONFIG.timeWindowMs,
       profitTarget: params.profitTarget ?? DEFAULT_BACKTEST_CONFIG.profitTarget,
@@ -217,7 +209,6 @@ export function getQuickOptimizationRanges(): OptimizationRanges {
   return {
     entryThreshold: { min: 0.80, max: 0.96, step: 0.04 },
     stopLoss: { min: 0.40, max: 0.70, step: 0.10 },
-    stopLossDelayMs: { min: 0, max: 5000, step: 5000 },
   };
 }
 
@@ -230,7 +221,6 @@ export function getDetailedOptimizationRanges(): OptimizationRanges {
     entryThreshold: { min: 0.70, max: 0.96, step: 0.02 },
     maxEntryPrice: { min: 0.94, max: 0.99, step: 0.01 },
     stopLoss: { min: 0.30, max: 0.80, step: 0.05 },
-    stopLossDelayMs: { min: 0, max: 10000, step: 1000 },
     maxSpread: { min: 0.02, max: 0.06, step: 0.02 },
     timeWindowMs: { min: 120000, max: 600000, step: 120000 },
   };

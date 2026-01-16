@@ -10,7 +10,6 @@ export function createRandomChromosome(bounds: ParameterBounds = DEFAULT_BOUNDS)
     entryThreshold: randomInRange(bounds.entryThreshold.min, bounds.entryThreshold.max),
     maxEntryPrice: randomInRange(bounds.maxEntryPrice.min, bounds.maxEntryPrice.max),
     stopLoss: randomInRange(bounds.stopLoss.min, bounds.stopLoss.max),
-    stopLossDelayMs: Math.round(randomInRange(bounds.stopLossDelayMs.min, bounds.stopLossDelayMs.max)),
     maxSpread: randomInRange(bounds.maxSpread.min, bounds.maxSpread.max),
     timeWindowMs: Math.round(randomInRange(bounds.timeWindowMs.min, bounds.timeWindowMs.max)),
     profitTarget: randomInRange(bounds.profitTarget.min, bounds.profitTarget.max),
@@ -37,14 +36,12 @@ export function repairChromosome(chromosome: Chromosome, bounds: ParameterBounds
   genes.profitTarget = roundTo(genes.profitTarget, 2);
 
   // Round time values to integers
-  genes.stopLossDelayMs = Math.round(genes.stopLossDelayMs);
   genes.timeWindowMs = Math.round(genes.timeWindowMs);
 
   // Clamp all values within bounds
   genes.entryThreshold = clamp(genes.entryThreshold, bounds.entryThreshold.min, bounds.entryThreshold.max);
   genes.maxEntryPrice = clamp(genes.maxEntryPrice, bounds.maxEntryPrice.min, bounds.maxEntryPrice.max);
   genes.stopLoss = clamp(genes.stopLoss, bounds.stopLoss.min, bounds.stopLoss.max);
-  genes.stopLossDelayMs = clamp(genes.stopLossDelayMs, bounds.stopLossDelayMs.min, bounds.stopLossDelayMs.max);
   genes.maxSpread = clamp(genes.maxSpread, bounds.maxSpread.min, bounds.maxSpread.max);
   genes.timeWindowMs = clamp(genes.timeWindowMs, bounds.timeWindowMs.min, bounds.timeWindowMs.max);
   genes.profitTarget = clamp(genes.profitTarget, bounds.profitTarget.min, bounds.profitTarget.max);
@@ -85,7 +82,6 @@ export function chromosomeToConfig(
     entryThreshold: chromosome.genes.entryThreshold,
     maxEntryPrice: chromosome.genes.maxEntryPrice,
     stopLoss: chromosome.genes.stopLoss,
-    stopLossDelayMs: chromosome.genes.stopLossDelayMs,
     maxSpread: chromosome.genes.maxSpread,
     timeWindowMs: chromosome.genes.timeWindowMs,
     profitTarget: chromosome.genes.profitTarget,
@@ -142,7 +138,6 @@ export function createChromosome(genes: Partial<Genes>, bounds: ParameterBounds 
     entryThreshold: genes.entryThreshold ?? (bounds.entryThreshold.min + bounds.entryThreshold.max) / 2,
     maxEntryPrice: genes.maxEntryPrice ?? (bounds.maxEntryPrice.min + bounds.maxEntryPrice.max) / 2,
     stopLoss: genes.stopLoss ?? (bounds.stopLoss.min + bounds.stopLoss.max) / 2,
-    stopLossDelayMs: genes.stopLossDelayMs ?? (bounds.stopLossDelayMs.min + bounds.stopLossDelayMs.max) / 2,
     maxSpread: genes.maxSpread ?? (bounds.maxSpread.min + bounds.maxSpread.max) / 2,
     timeWindowMs: genes.timeWindowMs ?? (bounds.timeWindowMs.min + bounds.timeWindowMs.max) / 2,
     profitTarget: genes.profitTarget ?? (bounds.profitTarget.min + bounds.profitTarget.max) / 2,

@@ -63,7 +63,6 @@ export function printBacktestReport(result: BacktestResult): void {
   console.log(`  Entry Range: ${formatCurrency(result.config.entryThreshold)} - ${formatCurrency(result.config.maxEntryPrice)}`);
   console.log(`  Profit Target: ${formatCurrency(result.config.profitTarget)}`);
   console.log(`  Stop Loss: ${formatCurrency(result.config.stopLoss)}`);
-  console.log(`  Stop Loss Delay: ${formatDuration(result.config.stopLossDelayMs)}`);
   console.log(`  Max Spread: ${formatCurrency(result.config.maxSpread)}`);
   console.log(`  Time Window: ${formatDuration(result.config.timeWindowMs)}`);
 
@@ -124,20 +123,19 @@ export function printOptimizationTable(
   const topResults = results.slice(0, limit);
 
   // Header
-  console.log("\nRank | Entry    | Stop  | Delay | Win%  | PnL      | Drawdown | Sharpe");
-  console.log("-----+----------+-------+-------+-------+----------+----------+-------");
+  console.log("\nRank | Entry    | Stop  | Win%  | PnL      | Drawdown | Sharpe");
+  console.log("-----+----------+-------+-------+----------+----------+-------");
 
   for (const r of topResults) {
     const entry = `$${r.config.entryThreshold.toFixed(2)}-${r.config.maxEntryPrice.toFixed(2)}`;
     const stop = `$${r.config.stopLoss.toFixed(2)}`;
-    const delay = `${(r.config.stopLossDelayMs / 1000).toFixed(0)}s`;
     const winRate = `${(r.metrics.winRate * 100).toFixed(1)}%`;
     const pnl = formatCurrency(r.metrics.totalPnL);
     const drawdown = formatPercent(r.metrics.maxDrawdownPercent);
     const sharpe = r.metrics.sharpeRatio.toFixed(2);
 
     console.log(
-      `${r.rank.toString().padStart(4)} | ${entry.padEnd(8)} | ${stop.padEnd(5)} | ${delay.padEnd(5)} | ${winRate.padEnd(5)} | ${pnl.padEnd(8)} | ${drawdown.padEnd(8)} | ${sharpe}`
+      `${r.rank.toString().padStart(4)} | ${entry.padEnd(8)} | ${stop.padEnd(5)} | ${winRate.padEnd(5)} | ${pnl.padEnd(8)} | ${drawdown.padEnd(8)} | ${sharpe}`
     );
   }
 
@@ -151,7 +149,6 @@ export function printOptimizationTable(
     console.log(`  Entry Threshold: ${formatCurrency(best.config.entryThreshold)}`);
     console.log(`  Max Entry Price: ${formatCurrency(best.config.maxEntryPrice)}`);
     console.log(`  Stop Loss: ${formatCurrency(best.config.stopLoss)}`);
-    console.log(`  Stop Loss Delay: ${formatDuration(best.config.stopLossDelayMs)}`);
     console.log(`  Max Spread: ${formatCurrency(best.config.maxSpread)}`);
     console.log(`  Time Window: ${formatDuration(best.config.timeWindowMs)}`);
     console.log("");
