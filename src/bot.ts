@@ -56,6 +56,8 @@ export interface BotState {
   // Dynamic-risk: loss streak tracking for dynamic entry threshold
   consecutiveLosses: number;
   consecutiveWins: number;
+  // Market resolutions from WebSocket (slug -> winning token ID)
+  marketResolutions: Map<string, string>;
 }
 
 export interface WsStats {
@@ -106,7 +108,8 @@ export class Bot {
       markets: [],
       paperTrading: config.paperTrading,
       consecutiveLosses: 0,
-      consecutiveWins: 0
+      consecutiveWins: 0,
+      marketResolutions: new Map()
     };
   }
 
@@ -382,7 +385,13 @@ export class Bot {
       const match = this.state.markets.find(m => m.slug === slug || (event.marketId && m.id === event.marketId));
       if (match && !match.closed) {
         match.closed = true;
-        this.log(`[WS] Market resolved: ${slug}`);
+        // Store winning asset ID for position resolution
+        if (event.winningAssetId) {
+          this.state.marketResolutions.set(slug, event.winningAssetId);
+          this.log(`[WS] Market resolved: ${slug} (winner: ${event.winningAssetId.slice(0, 8)}...)`);
+        } else {
+          this.log(`[WS] Market resolved: ${slug}`);
+        }
       }
       return;
     }
@@ -804,8 +813,24 @@ export class Bot {
         this.log(`Market expired for ${position.side} position`);
 
         if (this.config.paperTrading) {
-          // Paper trading: fetch resolution from API
-          const winner = await fetchMarketResolution(position.marketSlug);
+          // Paper trading: check WebSocket resolution first, then fall back to API
+          let winner: "UP" | "DOWN" | null = null;
+
+          // Check if we have resolution from WebSocket
+          const winningTokenId = this.state.marketResolutions.get(position.marketSlug);
+          if (winningTokenId) {
+            // Determine if UP or DOWN won by matching token ID
+            const market = this.state.markets.find(m => m.slug === position.marketSlug);
+            if (market && market.clobTokenIds.length >= 2) {
+              winner = winningTokenId === market.clobTokenIds[0] ? "UP" : "DOWN";
+              this.log(`[WS] Got resolution from WebSocket: ${winner} won`);
+            }
+          }
+
+          // Fall back to API if no WebSocket resolution
+          if (!winner) {
+            winner = await fetchMarketResolution(position.marketSlug);
+          }
 
           if (!winner) {
             this.log(`[PAPER] Waiting for market resolution...`);
