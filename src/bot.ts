@@ -804,28 +804,25 @@ export class Bot {
         this.log(`Market expired for ${position.side} position`);
 
         if (this.config.paperTrading) {
-          // Paper trading: Get actual price from WebSocket or estimate from market resolution
-          let exitPrice: number;
+          // Paper trading: Get actual resolution price from WebSocket
           const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
 
-          if (wsPrice && wsPrice.bestBid > 0) {
-            // Use actual market price if available
-            exitPrice = wsPrice.bestBid;
-            this.log(`[PAPER] Using actual bid price: $${exitPrice.toFixed(2)}`);
-          } else {
-            // Market has resolved - price should be ~$1.00 (win) or ~$0.00 (loss)
-            // Check if our side likely won based on last known price
-            // If we don't have price data, assume resolution based on entry confidence
-            // High entry price (>0.90) suggests high confidence, likely win
-            if (position.entryPrice >= 0.90) {
-              exitPrice = 0.99; // Assume win - market resolves at $1.00 minus spread
-            } else {
-              // Lower confidence entry - could go either way
-              // Use 50/50 estimate (conservative)
-              exitPrice = 0.50;
-            }
-            this.log(`[PAPER] Market resolved, estimated exit: $${exitPrice.toFixed(2)}`);
+          // Wait for valid resolution price - must be near $0 (loss) or $1 (win)
+          // Markets resolve binary: winning side = $1, losing side = $0
+          if (!wsPrice || wsPrice.bestBid <= 0) {
+            this.log(`[PAPER] Waiting for resolution price...`);
+            continue;
           }
+
+          const exitPrice = wsPrice.bestBid;
+
+          // If price is in mid-range, market hasn't resolved yet - wait
+          if (exitPrice > 0.05 && exitPrice < 0.95) {
+            this.log(`[PAPER] Price $${exitPrice.toFixed(2)} - market not yet resolved, waiting...`);
+            continue;
+          }
+
+          this.log(`[PAPER] Market resolved @ $${exitPrice.toFixed(2)}`);
 
           const proceeds = exitPrice * position.shares;
           const pnl = (exitPrice - position.entryPrice) * position.shares;
