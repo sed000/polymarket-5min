@@ -405,11 +405,11 @@ function App({ bot }: AppProps) {
         <Box flexDirection="column" width="50%">
           <MarketsTable markets={markets} />
           <PositionsTable state={state} config={bot.getConfig()} />
+          <Logs logs={state.logs} scrollOffset={logScrollOffset} autoScroll={autoScroll} />
         </Box>
         <Box flexDirection="column" width="50%" marginLeft={1}>
           <TradesTable trades={trades} />
           <WsPanel stats={wsStats} />
-          <Logs logs={state.logs} scrollOffset={logScrollOffset} autoScroll={autoScroll} />
         </Box>
       </Box>
       <Controls />
