@@ -11,20 +11,16 @@ let currentDbPath: string | null = null;
  * - Paper + dynamic-risk: trades_paper_dynamic.db
  * - Paper + safe: trades_paper_safe.db
  */
-export function initDatabase(paperTrading: boolean, riskMode: "normal" | "super-risk" | "dynamic-risk" | "safe"): void {
-  let dbPath: string;
+const DB_PATHS: Record<string, string> = {
+  "real": "trades_real.db",
+  "super-risk": "trades_paper_risk.db",
+  "dynamic-risk": "trades_paper_dynamic.db",
+  "safe": "trades_paper_safe.db",
+  "normal": "trades_paper_normal.db"
+};
 
-  if (!paperTrading) {
-    dbPath = "trades_real.db";
-  } else if (riskMode === "super-risk") {
-    dbPath = "trades_paper_risk.db";
-  } else if (riskMode === "dynamic-risk") {
-    dbPath = "trades_paper_dynamic.db";
-  } else if (riskMode === "safe") {
-    dbPath = "trades_paper_safe.db";
-  } else {
-    dbPath = "trades_paper_normal.db";
-  }
+export function initDatabase(paperTrading: boolean, riskMode: "normal" | "super-risk" | "dynamic-risk" | "safe"): void {
+  const dbPath = paperTrading ? (DB_PATHS[riskMode] || DB_PATHS.normal) : DB_PATHS.real;
 
   // Skip if already using this database
   if (currentDbPath === dbPath && db) {
@@ -153,18 +149,22 @@ export function getTotalPnL(): number {
 
 export function getTradeStats() {
   const database = ensureDb();
-  const total = database.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
-  const wins = database.prepare("SELECT COUNT(*) as count FROM trades WHERE pnl > 0").get() as { count: number };
-  const losses = database.prepare("SELECT COUNT(*) as count FROM trades WHERE pnl < 0").get() as { count: number };
-  const open = database.prepare("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'").get() as { count: number };
+  const stats = database.prepare(`
+    SELECT
+      COUNT(*) as total,
+      SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+      SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+      SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) as open
+    FROM trades
+  `).get() as { total: number; wins: number; losses: number; open: number };
 
-  const closedTrades = wins.count + losses.count;
+  const closedTrades = stats.wins + stats.losses;
   return {
-    total: total.count,
-    wins: wins.count,
-    losses: losses.count,
-    open: open.count,
-    winRate: closedTrades > 0 ? (wins.count / closedTrades) * 100 : 0
+    total: stats.total,
+    wins: stats.wins,
+    losses: stats.losses,
+    open: stats.open,
+    winRate: closedTrades > 0 ? (stats.wins / closedTrades) * 100 : 0
   };
 }
 

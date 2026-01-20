@@ -159,6 +159,27 @@ function getDateRange(args: ReturnType<typeof parseArguments>["values"]): { star
   return { startDate, endDate };
 }
 
+// Load cached data or fetch from API
+async function loadOrFetchMarkets(startDate: Date, endDate: Date): Promise<ReturnType<typeof loadCachedDataset> | null> {
+  console.log("Loading historical data...");
+  let markets = await loadCachedDataset(startDate, endDate);
+
+  if (markets.length === 0) {
+    console.log("\nNo cached data found. Fetching from API...");
+    markets = await fetchHistoricalDataset(startDate, endDate, {
+      onProgress: (p) => printProgress(p.current, p.total),
+    });
+    clearProgress();
+
+    if (markets.length === 0) {
+      console.log("No historical data available for this period.");
+      return null;
+    }
+  }
+
+  return markets;
+}
+
 // Build config from arguments (env config is the base, CLI args override)
 function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDate: Date, endDate: Date): BacktestConfig {
   const envConfig = getEnvConfig();
@@ -185,23 +206,8 @@ async function commandRun(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
   const config = buildConfig(args, startDate, endDate);
 
-  console.log("Loading historical data...");
-  const markets = await loadCachedDataset(startDate, endDate);
-
-  if (markets.length === 0) {
-    console.log("\nNo cached data found. Fetching from API...");
-    const fetchedMarkets = await fetchHistoricalDataset(startDate, endDate, {
-      onProgress: (p) => printProgress(p.current, p.total),
-    });
-    clearProgress();
-
-    if (fetchedMarkets.length === 0) {
-      console.log("No historical data available for this period.");
-      return;
-    }
-
-    markets.push(...fetchedMarkets);
-  }
+  const markets = await loadOrFetchMarkets(startDate, endDate);
+  if (!markets) return;
 
   console.log(`\nRunning backtest on ${markets.length} markets...`);
 
@@ -258,21 +264,8 @@ async function commandFetch(args: ReturnType<typeof parseArguments>["values"]) {
 async function commandOptimize(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
 
-  console.log("Loading historical data...");
-  let markets = await loadCachedDataset(startDate, endDate);
-
-  if (markets.length === 0) {
-    console.log("\nNo cached data found. Fetching from API...");
-    markets = await fetchHistoricalDataset(startDate, endDate, {
-      onProgress: (p) => printProgress(p.current, p.total),
-    });
-    clearProgress();
-
-    if (markets.length === 0) {
-      console.log("No historical data available for this period.");
-      return;
-    }
-  }
+  const markets = await loadOrFetchMarkets(startDate, endDate);
+  if (!markets) return;
 
   console.log(`\nOptimizing on ${markets.length} markets...`);
 
@@ -304,21 +297,8 @@ async function commandOptimize(args: ReturnType<typeof parseArguments>["values"]
 async function commandGenetic(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
 
-  console.log("Loading historical data...");
-  let markets = await loadCachedDataset(startDate, endDate);
-
-  if (markets.length === 0) {
-    console.log("\nNo cached data found. Fetching from API...");
-    markets = await fetchHistoricalDataset(startDate, endDate, {
-      onProgress: (p) => printProgress(p.current, p.total),
-    });
-    clearProgress();
-
-    if (markets.length === 0) {
-      console.log("No historical data available for this period.");
-      return;
-    }
-  }
+  const markets = await loadOrFetchMarkets(startDate, endDate);
+  if (!markets) return;
 
   console.log(`\nRunning genetic optimization on ${markets.length} markets...`);
 
@@ -370,21 +350,8 @@ async function commandGenetic(args: ReturnType<typeof parseArguments>["values"])
 async function commandCompare(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
 
-  console.log("Loading historical data...");
-  let markets = await loadCachedDataset(startDate, endDate);
-
-  if (markets.length === 0) {
-    console.log("\nNo cached data found. Fetching from API...");
-    markets = await fetchHistoricalDataset(startDate, endDate, {
-      onProgress: (p) => printProgress(p.current, p.total),
-    });
-    clearProgress();
-
-    if (markets.length === 0) {
-      console.log("No historical data available for this period.");
-      return;
-    }
-  }
+  const markets = await loadOrFetchMarkets(startDate, endDate);
+  if (!markets) return;
 
   console.log(`\nComparing configurations on ${markets.length} markets...`);
 

@@ -113,6 +113,34 @@ export class Bot {
     };
   }
 
+  private parseMarketEndDate(trade: Trade): Date {
+    if (trade.market_end_date) {
+      return new Date(trade.market_end_date);
+    }
+    const match = trade.market_slug.match(/btc-updown-15m-(\d+)/);
+    if (match) {
+      const startTimestamp = parseInt(match[1]) * 1000;
+      return new Date(startTimestamp + 15 * 60 * 1000);
+    }
+    return new Date(0);
+  }
+
+  private logDynamicStreak(isWin: boolean): void {
+    if (this.config.riskMode !== "dynamic-risk") return;
+    const streakType = isWin ? "Win" : "Loss";
+    const streakCount = isWin ? this.state.consecutiveWins : this.state.consecutiveLosses;
+    const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
+    this.log(`[DYNAMIC] ${streakType} streak: ${streakCount} | Entry threshold: $${newThreshold.toFixed(2)}`);
+  }
+
+  private getModeLabel(): string {
+    const labels: Record<string, string> = {
+      "super-risk": "[SUPER-RISK] ",
+      "dynamic-risk": "[DYNAMIC] "
+    };
+    return labels[this.config.riskMode] || "";
+  }
+
   /**
    * Get profit target based on risk mode
    */
@@ -230,21 +258,6 @@ export class Bot {
       // Load open paper trades from DB
       const openTrades = getOpenTrades();
       for (const trade of openTrades) {
-        // Try to parse end date from slug if not stored (btc-updown-15m-TIMESTAMP)
-        let marketEndDate: Date;
-        if (trade.market_end_date) {
-          marketEndDate = new Date(trade.market_end_date);
-        } else {
-          // Parse timestamp from slug and add 15 minutes
-          const match = trade.market_slug.match(/btc-updown-15m-(\d+)/);
-          if (match) {
-            const startTimestamp = parseInt(match[1]) * 1000;
-            marketEndDate = new Date(startTimestamp + 15 * 60 * 1000);
-          } else {
-            marketEndDate = new Date(0);
-          }
-        }
-
         this.state.positions.set(trade.token_id, {
           tradeId: trade.id,
           tokenId: trade.token_id,
@@ -252,7 +265,7 @@ export class Bot {
           entryPrice: trade.entry_price,
           side: trade.side as "UP" | "DOWN",
           marketSlug: trade.market_slug,
-          marketEndDate
+          marketEndDate: this.parseMarketEndDate(trade)
         });
       }
       if (openTrades.length > 0) {
@@ -291,21 +304,6 @@ export class Bot {
             continue;
           }
 
-          // Try to parse end date from slug if not stored (btc-updown-15m-TIMESTAMP)
-          let marketEndDate: Date;
-          if (trade.market_end_date) {
-            marketEndDate = new Date(trade.market_end_date);
-          } else {
-            // Parse timestamp from slug and add 15 minutes
-            const match = trade.market_slug.match(/btc-updown-15m-(\d+)/);
-            if (match) {
-              const startTimestamp = parseInt(match[1]) * 1000;
-              marketEndDate = new Date(startTimestamp + 15 * 60 * 1000);
-            } else {
-              marketEndDate = new Date(0);
-            }
-          }
-
           // Use actual balance from Polymarket, not DB value
           this.state.positions.set(trade.token_id, {
             tradeId: trade.id,
@@ -314,7 +312,7 @@ export class Bot {
             entryPrice: trade.entry_price,
             side: trade.side as "UP" | "DOWN",
             marketSlug: trade.market_slug,
-            marketEndDate
+            marketEndDate: this.parseMarketEndDate(trade)
           });
 
           this.log(`Loaded position: ${trade.side} with ${actualBalance.toFixed(2)} shares`);
@@ -494,9 +492,7 @@ export class Bot {
       this.state.consecutiveLosses = 0;
 
       this.log(`[${source}] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-      if (this.config.riskMode === "dynamic-risk") {
-        this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
-      }
+      this.logDynamicStreak(true);
       this.state.balance = await this.trader.getBalance();
     } finally {
       this.pendingLimitFills.delete(position.tokenId);
@@ -744,9 +740,7 @@ export class Bot {
 
             this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
             this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
-            if (this.config.riskMode === "dynamic-risk") {
-              this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
-            }
+            this.logDynamicStreak(true);
             this.checkCompoundLimit();
           }
         } else {
@@ -869,12 +863,7 @@ export class Bot {
 
           this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
           this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
-          if (this.config.riskMode === "dynamic-risk") {
-            const streakType = pnl > 0 ? "Win" : "Loss";
-            const streakCount = pnl > 0 ? this.state.consecutiveWins : this.state.consecutiveLosses;
-            const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
-            this.log(`[DYNAMIC] ${streakType} streak: ${streakCount} | Entry threshold: $${newThreshold.toFixed(2)}`);
-          }
+          this.logDynamicStreak(pnl > 0);
           this.checkCompoundLimit();
         } else {
           // Real trading: cancel limit order then market sell at actual price
@@ -902,12 +891,7 @@ export class Bot {
               }
 
               this.log(`Market resolved @ $${result.price.toFixed(2)}. PnL: $${realPnl.toFixed(2)}`);
-              if (this.config.riskMode === "dynamic-risk") {
-                const streakType = realPnl > 0 ? "Win" : "Loss";
-                const streakCount = realPnl > 0 ? this.state.consecutiveWins : this.state.consecutiveLosses;
-                const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
-                this.log(`[DYNAMIC] ${streakType} streak: ${streakCount} | Entry threshold: $${newThreshold.toFixed(2)}`);
-              }
+              this.logDynamicStreak(realPnl > 0);
 
               // Sync balance after exit
               this.state.balance = await this.trader.getBalance();
@@ -977,10 +961,7 @@ export class Bot {
         // Track consecutive losses (stop-loss = loss)
         this.state.consecutiveLosses++;
         this.state.consecutiveWins = 0;
-        if (this.config.riskMode === "dynamic-risk") {
-          const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
-          this.log(`[DYNAMIC] Loss streak: ${this.state.consecutiveLosses} | Entry threshold now: $${newThreshold.toFixed(2)}`);
-        }
+        this.logDynamicStreak(false);
 
         this.checkCompoundLimit();
       } else {
@@ -1001,10 +982,7 @@ export class Bot {
             // Track consecutive losses (stop-loss = loss)
             this.state.consecutiveLosses++;
             this.state.consecutiveWins = 0;
-            if (this.config.riskMode === "dynamic-risk") {
-              const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
-              this.log(`[DYNAMIC] Loss streak: ${this.state.consecutiveLosses} | Entry threshold now: $${newThreshold.toFixed(2)}`);
-            }
+            this.logDynamicStreak(false);
 
             // Sync balance after exit
             this.state.balance = await this.trader.getBalance();
@@ -1223,10 +1201,8 @@ export class Bot {
         this.log(`Re-entering ${side} after loss (prev PnL: $${lastTrade.pnl?.toFixed(2) || 'unknown'})`);
       }
 
-      const modeLabel = this.config.riskMode === "super-risk" ? "[SUPER-RISK] " :
-                        this.config.riskMode === "dynamic-risk" ? "[DYNAMIC] " : "";
       const stopInfo = dynamicStopLoss ? ` (stop: $${dynamicStopLoss.toFixed(2)})` : "";
-      this.log(`${modeLabel}Entry signal: ${side} @ $${askPrice.toFixed(2)} ask${stopInfo} (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
+      this.log(`${this.getModeLabel()}Entry signal: ${side} @ $${askPrice.toFixed(2)} ask${stopInfo} (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
       if (this.config.paperTrading) {
         // Paper trading: simulate buy at ask price

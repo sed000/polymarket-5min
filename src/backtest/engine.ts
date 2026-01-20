@@ -134,7 +134,7 @@ export class BacktestEngine {
     if (this.position && this.position.tokenId === tick.tokenId) {
       // Check profit target
       if (tick.bestBid >= this.config.profitTarget) {
-        this.executeExit(this.config.profitTarget, tick.timestamp, "this.config.profitTarget");
+        this.executeExit(this.config.profitTarget, tick.timestamp, "PROFIT_TARGET");
         return;
       }
 

@@ -117,6 +117,41 @@ export class Trader {
     return this.client;
   }
 
+  private isBalanceAllowanceError(msg: string): boolean {
+    return msg.includes("balance") || msg.includes("allowance");
+  }
+
+  private async validateAndAdjustShares(
+    tokenId: string,
+    shares: number,
+    logPrefix: string
+  ): Promise<number | null> {
+    const positionBalance = await this.getPositionBalance(tokenId);
+
+    if (positionBalance < 0.01) {
+      console.error(`${logPrefix} No position to sell (balance: ${positionBalance.toFixed(4)})`);
+      return null;
+    }
+
+    const sharesToSell = Math.min(shares, positionBalance);
+
+    if (sharesToSell < 0.01) {
+      console.error(`${logPrefix} Shares to sell too small: ${sharesToSell.toFixed(4)}`);
+      return null;
+    }
+
+    if (sharesToSell < MIN_ORDER_SIZE) {
+      console.error(`${logPrefix} Actual balance ${sharesToSell.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares`);
+      return null;
+    }
+
+    if (sharesToSell < shares * 0.99) {
+      console.log(`${logPrefix} Adjusted sell: ${shares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
+    }
+
+    return sharesToSell;
+  }
+
   async getBalance(): Promise<number> {
     const client = this.ensureClient();
     // Get USDC balance from the exchange
@@ -251,33 +286,8 @@ export class Trader {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        // Check actual position balance
-        const positionBalance = await this.getPositionBalance(tokenId);
-
-        // If we have no shares, can't sell
-        if (positionBalance < 0.01) {
-          console.error(`No position to sell (balance: ${positionBalance.toFixed(4)})`);
-          return null;
-        }
-
-        // Use actual balance if less than requested (safety: sell what we have)
-        const sharesToSell = Math.min(shares, positionBalance);
-
-        // Final validation - must have meaningful amount to sell
-        if (sharesToSell < 0.01) {
-          console.error(`Shares to sell too small: ${sharesToSell.toFixed(4)}`);
-          return null;
-        }
-
-        // Check minimum order size with actual balance
-        if (sharesToSell < MIN_ORDER_SIZE) {
-          console.error(`Actual balance ${sharesToSell.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares - cannot place limit sell`);
-          return null;
-        }
-
-        if (sharesToSell < shares * 0.99) {
-          console.log(`Adjusted sell amount: ${shares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
-        }
+        const sharesToSell = await this.validateAndAdjustShares(tokenId, shares, "");
+        if (sharesToSell === null) return null;
 
         // Validate price is within Polymarket's allowed range (0.01 - 0.99)
         if (price < 0.01 || price > 0.99) {
@@ -301,9 +311,7 @@ export class Trader {
           };
         }
 
-        // Check if error is balance/allowance related
-        const errorMsg = response.errorMsg || "";
-        if (errorMsg.includes("balance") || errorMsg.includes("allowance")) {
+        if (this.isBalanceAllowanceError(response.errorMsg || "")) {
           console.log(`Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
           await new Promise(resolve => setTimeout(resolve, 3000));
           continue;
@@ -312,8 +320,7 @@ export class Trader {
         console.error("Limit sell failed:", response.errorMsg);
         return null;
       } catch (err: any) {
-        const errorStr = err?.toString() || "";
-        if (errorStr.includes("balance") || errorStr.includes("allowance")) {
+        if (this.isBalanceAllowanceError(err?.toString() || "")) {
           console.log(`Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
           await new Promise(resolve => setTimeout(resolve, 3000));
           continue;
@@ -344,33 +351,8 @@ export class Trader {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        // Check actual position balance
-        const positionBalance = await this.getPositionBalance(tokenId);
-
-        // If we have no shares, can't sell
-        if (positionBalance < 0.01) {
-          console.error(`[STOP-LOSS] No position to sell (balance: ${positionBalance.toFixed(4)})`);
-          return null;
-        }
-
-        // Use actual balance if less than requested (safety: sell what we have)
-        const sharesToSell = Math.min(shares, positionBalance);
-
-        // Final validation - must have meaningful amount to sell
-        if (sharesToSell < 0.01) {
-          console.error(`[STOP-LOSS] Shares to sell too small: ${sharesToSell.toFixed(4)}`);
-          return null;
-        }
-
-        // Check minimum order size with actual balance
-        if (sharesToSell < MIN_ORDER_SIZE) {
-          console.error(`[STOP-LOSS] Actual balance ${sharesToSell.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares - cannot execute stop-loss`);
-          return null;
-        }
-
-        if (sharesToSell < shares * 0.99) {
-          console.log(`[STOP-LOSS] Adjusted sell: ${shares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
-        }
+        const sharesToSell = await this.validateAndAdjustShares(tokenId, shares, "[STOP-LOSS]");
+        if (sharesToSell === null) return null;
 
         // Get current bid price for market sell (already rate limited)
         const { bid } = await this.getPrice(tokenId);
@@ -402,9 +384,7 @@ export class Trader {
           };
         }
 
-        // Check if error is balance/allowance related
-        const errorMsg = response.errorMsg || "";
-        if (errorMsg.includes("balance") || errorMsg.includes("allowance")) {
+        if (this.isBalanceAllowanceError(response.errorMsg || "")) {
           console.log(`[STOP-LOSS] Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
           await new Promise(resolve => setTimeout(resolve, 3000));
           continue;
@@ -413,8 +393,7 @@ export class Trader {
         console.error("Sell failed:", response.errorMsg);
         return null;
       } catch (err: any) {
-        const errorStr = err?.toString() || "";
-        if (errorStr.includes("balance") || errorStr.includes("allowance")) {
+        if (this.isBalanceAllowanceError(err?.toString() || "")) {
           console.log(`[STOP-LOSS] Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
           await new Promise(resolve => setTimeout(resolve, 3000));
           continue;

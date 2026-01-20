@@ -2,6 +2,16 @@ import { gammaLimiter } from "./rate-limiter";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 
+function parseJsonField<T>(value: unknown): T[] {
+  if (typeof value === "string") {
+    return JSON.parse(value);
+  }
+  if (Array.isArray(value)) {
+    return value as T[];
+  }
+  return [];
+}
+
 export interface Market {
   id: string;
   slug: string;
@@ -72,27 +82,9 @@ export async function fetchBtc15MinMarkets(): Promise<Market[]> {
 
 function parseMarket(event: any, market: any): Market | null {
   try {
-    let outcomes: string[] = [];
-    let outcomePrices: string[] = [];
-    let clobTokenIds: string[] = [];
-
-    if (typeof market.outcomes === 'string') {
-      outcomes = JSON.parse(market.outcomes);
-    } else if (Array.isArray(market.outcomes)) {
-      outcomes = market.outcomes;
-    }
-
-    if (typeof market.outcomePrices === 'string') {
-      outcomePrices = JSON.parse(market.outcomePrices);
-    } else if (Array.isArray(market.outcomePrices)) {
-      outcomePrices = market.outcomePrices;
-    }
-
-    if (typeof market.clobTokenIds === 'string') {
-      clobTokenIds = JSON.parse(market.clobTokenIds);
-    } else if (Array.isArray(market.clobTokenIds)) {
-      clobTokenIds = market.clobTokenIds;
-    }
+    const outcomes = parseJsonField<string>(market.outcomes);
+    const outcomePrices = parseJsonField<string>(market.outcomePrices);
+    const clobTokenIds = parseJsonField<string>(market.clobTokenIds);
 
     if (outcomes.length < 2 || clobTokenIds.length < 2) {
       return null;
@@ -226,21 +218,8 @@ export async function fetchMarketResolution(slug: string): Promise<"UP" | "DOWN"
       if (!event.markets || !Array.isArray(event.markets)) continue;
 
       for (const market of event.markets) {
-        // Parse outcomes and prices
-        let outcomes: string[] = [];
-        let outcomePrices: string[] = [];
-
-        if (typeof market.outcomes === 'string') {
-          outcomes = JSON.parse(market.outcomes);
-        } else if (Array.isArray(market.outcomes)) {
-          outcomes = market.outcomes;
-        }
-
-        if (typeof market.outcomePrices === 'string') {
-          outcomePrices = JSON.parse(market.outcomePrices);
-        } else if (Array.isArray(market.outcomePrices)) {
-          outcomePrices = market.outcomePrices;
-        }
+        const outcomes = parseJsonField<string>(market.outcomes);
+        const outcomePrices = parseJsonField<string>(market.outcomePrices);
 
         if (outcomes.length < 2 || outcomePrices.length < 2) continue;
 

@@ -119,15 +119,8 @@ export async function runOptimization(
 
     // Build full config
     const config: BacktestConfig = {
-      entryThreshold: params.entryThreshold ?? DEFAULT_BACKTEST_CONFIG.entryThreshold,
-      maxEntryPrice: params.maxEntryPrice ?? DEFAULT_BACKTEST_CONFIG.maxEntryPrice,
-      stopLoss: params.stopLoss ?? DEFAULT_BACKTEST_CONFIG.stopLoss,
-      maxSpread: params.maxSpread ?? DEFAULT_BACKTEST_CONFIG.maxSpread,
-      timeWindowMs: params.timeWindowMs ?? DEFAULT_BACKTEST_CONFIG.timeWindowMs,
-      profitTarget: params.profitTarget ?? DEFAULT_BACKTEST_CONFIG.profitTarget,
-      startingBalance: params.startingBalance ?? DEFAULT_BACKTEST_CONFIG.startingBalance,
-      slippage: params.slippage ?? DEFAULT_BACKTEST_CONFIG.slippage,
-      riskMode: params.riskMode ?? DEFAULT_BACKTEST_CONFIG.riskMode,
+      ...DEFAULT_BACKTEST_CONFIG,
+      ...params,
       startDate: options.startDate,
       endDate: options.endDate,
     };

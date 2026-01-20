@@ -3,7 +3,6 @@ import WebSocket from "ws";
 const WS_BASE_URL = "wss://ws-subscriptions-clob.polymarket.com";
 const MARKET_WS_URL = `${WS_BASE_URL}/ws/market`;
 const USER_WS_URL = `${WS_BASE_URL}/ws/user`;
-const CUSTOM_FEATURE_ENABLED = true;
 const SUBSCRIBE_TIMEOUT_MS = 5000;
 
 export interface PriceUpdate {
@@ -80,6 +79,21 @@ export class PriceStream {
 
   constructor() {}
 
+  private clearTimers(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.subscriptionCheckTimer) {
+      clearTimeout(this.subscriptionCheckTimer);
+      this.subscriptionCheckTimer = null;
+    }
+  }
+
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
@@ -134,14 +148,7 @@ export class PriceStream {
         this.ws.onclose = () => {
           this.connected = false;
           this.notifyConnectionChange(false);
-          if (this.pingTimer) {
-            clearInterval(this.pingTimer);
-            this.pingTimer = null;
-          }
-          if (this.subscriptionCheckTimer) {
-            clearTimeout(this.subscriptionCheckTimer);
-            this.subscriptionCheckTimer = null;
-          }
+          this.clearTimers();
           this.pendingSubscriptions.clear();
           // Reconnect immediately if intentional, otherwise wait 3 seconds
           const delay = this.intentionalReconnect ? 100 : 3000;
@@ -447,7 +454,7 @@ export class PriceStream {
     const msg: Record<string, unknown> = {
       assets_ids: tokenIds,
       type: "market",
-      custom_feature_enabled: CUSTOM_FEATURE_ENABLED
+      custom_feature_enabled: true
     };
     if (operation) {
       msg.operation = operation;
@@ -550,16 +557,7 @@ export class PriceStream {
   }
 
   close() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-    }
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-    }
-    if (this.subscriptionCheckTimer) {
-      clearTimeout(this.subscriptionCheckTimer);
-      this.subscriptionCheckTimer = null;
-    }
+    this.clearTimers();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -585,6 +583,17 @@ export class UserStream {
   private connected = false;
   private intentionalReconnect = false;
   private lastMessageAt = 0;
+
+  private clearTimers(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
 
   connect(auth?: UserAuth, markets?: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -652,10 +661,7 @@ export class UserStream {
         this.ws.onclose = () => {
           this.connected = false;
           this.notifyConnectionChange(false);
-          if (this.pingTimer) {
-            clearInterval(this.pingTimer);
-            this.pingTimer = null;
-          }
+          this.clearTimers();
           const delay = this.intentionalReconnect ? 100 : 3000;
           this.intentionalReconnect = false;
           this.reconnectTimer = setTimeout(() => this.connect(), delay);
@@ -768,12 +774,7 @@ export class UserStream {
   }
 
   close() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-    }
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-    }
+    this.clearTimers();
     if (this.ws) {
       this.ws.close();
       this.ws = null;

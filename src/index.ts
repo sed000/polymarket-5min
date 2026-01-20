@@ -2,6 +2,12 @@ import { Bot, type BotConfig } from "./bot";
 import { renderUI } from "./ui";
 import { initDatabase } from "./db";
 
+const parseEnvFloat = (key: string, defaultVal: string): number =>
+  parseFloat(process.env[key] || defaultVal);
+
+const parseEnvInt = (key: string, defaultVal: string): number =>
+  parseInt(process.env[key] || defaultVal);
+
 const paperTrading = process.env.PAPER_TRADING === "true";
 
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
@@ -15,42 +21,45 @@ if (!PRIVATE_KEY && !paperTrading) {
 }
 
 const config: BotConfig = {
-  entryThreshold: parseFloat(process.env.ENTRY_THRESHOLD || "0.95"),
-  maxEntryPrice: parseFloat(process.env.MAX_ENTRY_PRICE || "0.98"),
-  stopLoss: parseFloat(process.env.STOP_LOSS || "0.80"),
-  maxSpread: parseFloat(process.env.MAX_SPREAD || "0.03"),
-  timeWindowMs: parseInt(process.env.TIME_WINDOW_MINS || "5") * 60 * 1000,
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000"),
+  entryThreshold: parseEnvFloat("ENTRY_THRESHOLD", "0.95"),
+  maxEntryPrice: parseEnvFloat("MAX_ENTRY_PRICE", "0.98"),
+  stopLoss: parseEnvFloat("STOP_LOSS", "0.80"),
+  maxSpread: parseEnvFloat("MAX_SPREAD", "0.03"),
+  timeWindowMs: parseEnvInt("TIME_WINDOW_MINS", "5") * 60 * 1000,
+  pollIntervalMs: parseEnvInt("POLL_INTERVAL_MS", "10000"),
   paperTrading,
-  paperBalance: parseFloat(process.env.PAPER_BALANCE || "100"),
+  paperBalance: parseEnvFloat("PAPER_BALANCE", "100"),
   riskMode: (process.env.RISK_MODE || "normal") as "normal" | "super-risk" | "dynamic-risk" | "safe",
-  compoundLimit: parseFloat(process.env.COMPOUND_LIMIT || "0"),
-  baseBalance: parseFloat(process.env.BASE_BALANCE || "10"),
-  signatureType: parseInt(process.env.SIGNATURE_TYPE || "1") as 0 | 1 | 2,
+  compoundLimit: parseEnvFloat("COMPOUND_LIMIT", "0"),
+  baseBalance: parseEnvFloat("BASE_BALANCE", "10"),
+  signatureType: parseEnvInt("SIGNATURE_TYPE", "1") as 0 | 1 | 2,
   funderAddress: process.env.FUNDER_ADDRESS,
-  maxPositions: parseInt(process.env.MAX_POSITIONS || "1")
+  maxPositions: parseEnvInt("MAX_POSITIONS", "1")
 };
 
 // Validate configuration to catch invalid env vars early
+const validateRange = (val: number, min: number, max: number): boolean =>
+  !isNaN(val) && val >= min && val <= max;
+
 function validateConfig(config: BotConfig): void {
   const errors: string[] = [];
 
-  if (isNaN(config.entryThreshold) || config.entryThreshold < 0 || config.entryThreshold > 1) {
+  if (!validateRange(config.entryThreshold, 0, 1)) {
     errors.push("ENTRY_THRESHOLD must be a number between 0 and 1");
   }
-  if (isNaN(config.stopLoss) || config.stopLoss < 0 || config.stopLoss > 1) {
+  if (!validateRange(config.stopLoss, 0, 1)) {
     errors.push("STOP_LOSS must be a number between 0 and 1");
   }
-  if (isNaN(config.maxEntryPrice) || config.maxEntryPrice < 0 || config.maxEntryPrice > 1) {
+  if (!validateRange(config.maxEntryPrice, 0, 1)) {
     errors.push("MAX_ENTRY_PRICE must be a number between 0 and 1");
   }
   if (config.stopLoss >= config.entryThreshold) {
     errors.push("STOP_LOSS must be less than ENTRY_THRESHOLD");
   }
-  if (isNaN(config.paperBalance) || config.paperBalance < 0) {
+  if (!validateRange(config.paperBalance, 0, Infinity)) {
     errors.push("PAPER_BALANCE must be a positive number");
   }
-  if (isNaN(config.maxPositions) || config.maxPositions < 1) {
+  if (!validateRange(config.maxPositions, 1, Infinity)) {
     errors.push("MAX_POSITIONS must be at least 1");
   }
 
