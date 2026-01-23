@@ -61,6 +61,11 @@ type PriceCallback = (update: PriceUpdate) => void;
 type MarketCallback = (event: MarketEvent) => void;
 type ConnectionCallback = (connected: boolean) => void;
 
+// Exponential backoff constants
+const INITIAL_RECONNECT_DELAY_MS = 1000;
+const MAX_RECONNECT_DELAY_MS = 30000;
+const MAX_PRICE_CACHE_SIZE = 500;
+
 export class PriceStream {
   private ws: WebSocket | null = null;
   private subscriptions: Set<string> = new Set();
@@ -76,6 +81,7 @@ export class PriceStream {
   private connected = false;
   private intentionalReconnect = false;
   private lastMessageAt = 0;
+  private reconnectAttempts = 0;
 
   constructor() {}
 
@@ -106,6 +112,7 @@ export class PriceStream {
         this.ws.onopen = () => {
           clearTimeout(timeout);
           this.connected = true;
+          this.reconnectAttempts = 0; // Reset backoff on successful connection
           this.notifyConnectionChange(true);
 
           // Market channel does NOT require authentication (only user channel does)
@@ -136,8 +143,9 @@ export class PriceStream {
             // Debug: uncomment to see all messages
             // console.log("[WS RAW]", JSON.stringify(data).slice(0, 200));
             this.handleMessage(data);
-          } catch {
-            // Ignore parse errors
+          } catch (err) {
+            // Log parse errors for debugging - don't silently ignore
+            console.error(`[WS] Message parse error: ${err instanceof Error ? err.message : err}`);
           }
         };
 
@@ -150,8 +158,23 @@ export class PriceStream {
           this.notifyConnectionChange(false);
           this.clearTimers();
           this.pendingSubscriptions.clear();
-          // Reconnect immediately if intentional, otherwise wait 3 seconds
-          const delay = this.intentionalReconnect ? 100 : 3000;
+
+          // Calculate reconnect delay with exponential backoff
+          let delay: number;
+          if (this.intentionalReconnect) {
+            delay = 100;
+            this.reconnectAttempts = 0;
+          } else {
+            // Exponential backoff: 1s, 2s, 4s, 8s, ... up to 30s
+            delay = Math.min(
+              INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+              MAX_RECONNECT_DELAY_MS
+            );
+            // Add jitter (0-25% of delay) to prevent thundering herd
+            delay += Math.random() * delay * 0.25;
+            this.reconnectAttempts++;
+            console.log(`[WS] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
+          }
           this.intentionalReconnect = false;
           this.reconnectTimer = setTimeout(() => this.connect(), delay);
         };
@@ -222,7 +245,29 @@ export class PriceStream {
     return parsed;
   }
 
+  /**
+   * Validate price is within Polymarket's valid range
+   */
+  private isValidPrice(price: number): boolean {
+    return Number.isFinite(price) && price >= 0 && price <= 1;
+  }
+
   private recordPrice(update: PriceUpdate) {
+    // Validate prices before recording
+    if (!this.isValidPrice(update.bestBid) || !this.isValidPrice(update.bestAsk)) {
+      console.warn(`[WS] Invalid price for ${update.tokenId}: bid=${update.bestBid}, ask=${update.bestAsk}`);
+      return;
+    }
+
+    // Enforce memory limit - evict oldest entries if over limit
+    if (this.prices.size >= MAX_PRICE_CACHE_SIZE && !this.prices.has(update.tokenId)) {
+      // Find and remove the oldest entry (first entry in iteration order)
+      const oldestKey = this.prices.keys().next().value;
+      if (oldestKey) {
+        this.prices.delete(oldestKey);
+      }
+    }
+
     this.prices.set(update.tokenId, update);
     this.pendingSubscriptions.delete(update.tokenId);
     this.notifyCallbacks(update);
@@ -419,8 +464,8 @@ export class PriceStream {
     for (const cb of this.callbacks) {
       try {
         cb(update);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[WS] Price callback error for ${update.tokenId}: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -429,8 +474,8 @@ export class PriceStream {
     for (const cb of this.marketCallbacks) {
       try {
         cb(event);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[WS] Market event callback error: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -439,8 +484,8 @@ export class PriceStream {
     for (const cb of this.connectionCallbacks) {
       try {
         cb(connected);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[WS] Connection callback error: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -583,6 +628,7 @@ export class UserStream {
   private connected = false;
   private intentionalReconnect = false;
   private lastMessageAt = 0;
+  private reconnectAttempts = 0;
 
   private clearTimers(): void {
     if (this.reconnectTimer) {
@@ -618,6 +664,7 @@ export class UserStream {
         this.ws.onopen = () => {
           clearTimeout(timeout);
           this.connected = true;
+          this.reconnectAttempts = 0; // Reset backoff on successful connection
           this.notifyConnectionChange(true);
 
           this.pingTimer = setInterval(() => {
@@ -629,9 +676,9 @@ export class UserStream {
           const payload: Record<string, unknown> = {
             type: "user",
             auth: {
-              apiKey: this.auth.apiKey,
-              secret: this.auth.secret,
-              passphrase: this.auth.passphrase
+              apiKey: this.auth!.apiKey,
+              secret: this.auth!.secret,
+              passphrase: this.auth!.passphrase
             }
           };
           if (this.markets.size > 0) {
@@ -649,8 +696,8 @@ export class UserStream {
 
             const data = JSON.parse(msg);
             this.handleMessage(data);
-          } catch {
-            // Ignore parse errors
+          } catch (err) {
+            console.error(`[UserWS] Message parse error: ${err instanceof Error ? err.message : err}`);
           }
         };
 
@@ -662,7 +709,21 @@ export class UserStream {
           this.connected = false;
           this.notifyConnectionChange(false);
           this.clearTimers();
-          const delay = this.intentionalReconnect ? 100 : 3000;
+
+          // Calculate reconnect delay with exponential backoff
+          let delay: number;
+          if (this.intentionalReconnect) {
+            delay = 100;
+            this.reconnectAttempts = 0;
+          } else {
+            delay = Math.min(
+              INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+              MAX_RECONNECT_DELAY_MS
+            );
+            delay += Math.random() * delay * 0.25;
+            this.reconnectAttempts++;
+            console.log(`[UserWS] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
+          }
           this.intentionalReconnect = false;
           this.reconnectTimer = setTimeout(() => this.connect(), delay);
         };
@@ -697,8 +758,8 @@ export class UserStream {
     for (const cb of this.tradeCallbacks) {
       try {
         cb(event);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[UserWS] Trade callback error: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -707,8 +768,8 @@ export class UserStream {
     for (const cb of this.orderCallbacks) {
       try {
         cb(event);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[UserWS] Order callback error: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -717,8 +778,8 @@ export class UserStream {
     for (const cb of this.connectionCallbacks) {
       try {
         cb(connected);
-      } catch {
-        // Ignore callback errors
+      } catch (err) {
+        console.error(`[WS] Connection callback error: ${err instanceof Error ? err.message : err}`);
       }
     }
   }

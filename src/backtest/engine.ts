@@ -9,6 +9,14 @@ import type {
   ExitReason,
 } from "./types";
 
+import {
+  DYNAMIC_RISK_BASE_THRESHOLD,
+  DYNAMIC_RISK_THRESHOLD_INCREMENT,
+  DYNAMIC_RISK_MAX_THRESHOLD,
+  DYNAMIC_RISK_MAX_DRAWDOWN_PERCENT,
+  DYNAMIC_RISK_SPREAD_ADJUSTMENT,
+} from "./types";
+
 interface EquityPoint {
   timestamp: number;
   balance: number;
@@ -34,11 +42,44 @@ export class BacktestEngine {
   private lastTrade: BacktestTrade | null = null;
   private currentMarket: HistoricalMarket | null = null;
 
+  // Dynamic-risk mode: loss/win streak tracking for adaptive threshold
+  private consecutiveLosses: number = 0;
+  private consecutiveWins: number = 0;
+
   constructor(config: BacktestConfig) {
     this.config = config;
     this.balance = config.startingBalance;
     this.peakBalance = config.startingBalance;
     this.savedProfit = 0;
+    this.consecutiveLosses = 0;
+    this.consecutiveWins = 0;
+  }
+
+  /**
+   * Get dynamic entry threshold for dynamic-risk mode
+   * Base: $0.70, +$0.05 per consecutive loss, capped at $0.85
+   */
+  private getDynamicEntryThreshold(): number {
+    if (this.config.riskMode !== "dynamic-risk") {
+      return this.config.entryThreshold;
+    }
+
+    const adjustment = Math.min(
+      this.consecutiveLosses * DYNAMIC_RISK_THRESHOLD_INCREMENT,
+      DYNAMIC_RISK_MAX_THRESHOLD - DYNAMIC_RISK_BASE_THRESHOLD
+    );
+    return DYNAMIC_RISK_BASE_THRESHOLD + adjustment;
+  }
+
+  /**
+   * Calculate entry-relative dynamic stop-loss for dynamic-risk mode
+   * 32.5% max drawdown from entry price
+   */
+  private getDynamicStopLoss(entryPrice: number): number | undefined {
+    if (this.config.riskMode !== "dynamic-risk") {
+      return undefined;
+    }
+    return entryPrice * (1 - DYNAMIC_RISK_MAX_DRAWDOWN_PERCENT);
   }
 
   /**
@@ -54,6 +95,8 @@ export class BacktestEngine {
     this.equityCurve = [];
     this.peakBalance = this.config.startingBalance;
     this.lastTrade = null;
+    this.consecutiveLosses = 0;
+    this.consecutiveWins = 0;
 
     // Build a map of markets by slug for quick lookup
     const marketMap = new Map<string, HistoricalMarket>();
@@ -151,20 +194,25 @@ export class BacktestEngine {
 
   /**
    * Check stop-loss conditions - execute immediately if triggered
+   * Uses dynamic stop-loss (entry-relative) for dynamic-risk mode
    */
   private checkStopLoss(tick: PriceTick): void {
     if (!this.position) return;
 
     const currentBid = tick.bestBid;
 
+    // Use dynamic stop-loss if available (dynamic-risk), otherwise use fixed config
+    const effectiveStopLoss = this.position.dynamicStopLoss ?? this.config.stopLoss;
+
     // Check if price is below stop-loss threshold - execute immediately
-    if (currentBid <= this.config.stopLoss) {
+    if (currentBid <= effectiveStopLoss) {
       this.executeExit(currentBid, tick.timestamp, "STOP_LOSS");
     }
   }
 
   /**
    * Check entry conditions
+   * Supports dynamic-risk mode with adaptive threshold and spread adjustment
    */
   private checkEntry(tick: PriceTick, market: HistoricalMarket): void {
     const now = tick.timestamp;
@@ -186,9 +234,20 @@ export class BacktestEngine {
       return;
     }
 
+    // Get entry threshold (dynamic for dynamic-risk mode)
+    let entryThreshold = this.getDynamicEntryThreshold();
+
+    // Dynamic-risk: Apply spread-based threshold adjustment
+    // Wide spreads (>50% of max) require higher entry for extra safety
+    if (this.config.riskMode === "dynamic-risk") {
+      if (spread > this.config.maxSpread * 0.5) {
+        entryThreshold += DYNAMIC_RISK_SPREAD_ADJUSTMENT;
+      }
+    }
+
     // Check entry threshold
     const askPrice = tick.bestAsk;
-    if (askPrice < this.config.entryThreshold || askPrice > this.config.maxEntryPrice) {
+    if (askPrice < entryThreshold || askPrice > this.config.maxEntryPrice) {
       return;
     }
 
@@ -197,13 +256,13 @@ export class BacktestEngine {
       return;
     }
 
-    // Check opposite-side rule
-    // If last trade on same market was a WIN (sold at 99), skip same side
+    // Check opposite-side rule (using PnL for parity with bot.ts)
+    // If last trade on same market was a WIN (positive PnL), skip same side
     if (
       this.lastTrade &&
       this.lastTrade.marketSlug === market.slug &&
       this.lastTrade.side === side &&
-      this.lastTrade.exitPrice >= this.config.profitTarget
+      this.lastTrade.pnl > 0
     ) {
       return;
     }
@@ -229,6 +288,9 @@ export class BacktestEngine {
     // Calculate shares
     const shares = this.balance / entryPrice;
 
+    // Calculate dynamic stop-loss for dynamic-risk mode
+    const dynamicStopLoss = this.getDynamicStopLoss(entryPrice);
+
     // Create position
     this.position = {
       tokenId: tick.tokenId,
@@ -237,6 +299,7 @@ export class BacktestEngine {
       shares,
       entryPrice,
       entryTimestamp: tick.timestamp,
+      dynamicStopLoss,
     };
 
     // Deduct from balance
@@ -278,6 +341,15 @@ export class BacktestEngine {
 
     this.trades.push(trade);
     this.lastTrade = trade;
+
+    // Track consecutive wins/losses for dynamic-risk mode
+    if (pnl > 0) {
+      this.consecutiveWins++;
+      this.consecutiveLosses = 0;
+    } else {
+      this.consecutiveLosses++;
+      this.consecutiveWins = 0;
+    }
 
     // Update balance
     const proceeds = finalExitPrice * this.position.shares;

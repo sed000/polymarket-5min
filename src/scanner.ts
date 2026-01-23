@@ -71,8 +71,8 @@ export async function fetchBtc15MinMarkets(): Promise<Market[]> {
           }
         }
       }
-    } catch {
-      // Skip failed requests
+    } catch (err) {
+      console.warn(`[Scanner] Failed to fetch market ${slug}: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -101,7 +101,8 @@ function parseMarket(event: any, market: any): Market | null {
       active: market.active !== false,
       closed: market.closed === true
     };
-  } catch {
+  } catch (err) {
+    console.warn(`[Scanner] Error parsing market: ${err instanceof Error ? err.message : err}`);
     return null;
   }
 }
@@ -237,8 +238,8 @@ export async function fetchMarketResolution(slug: string): Promise<"UP" | "DOWN"
         if (downPrice > 0.9) return "DOWN";
       }
     }
-  } catch {
-    // Ignore errors
+  } catch (err) {
+    console.warn(`[Scanner] Error fetching resolution for ${slug}: ${err instanceof Error ? err.message : err}`);
   }
   return null;
 }

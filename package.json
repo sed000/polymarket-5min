@@ -5,6 +5,8 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
     "db:real": "sqlite3 -header -column trades_real.db \"SELECT id, substr(market_slug, 1, 25) as market, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl, substr(created_at, 1, 16) as time FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
     "db:paper": "sqlite3 -header -column trades_paper_normal.db \"SELECT id, substr(market_slug, 1, 25) as market, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl, substr(created_at, 1, 16) as time FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
     "db:risk": "sqlite3 -header -column trades_paper_risk.db \"SELECT id, substr(market_slug, 1, 25) as market, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl, substr(created_at, 1, 16) as time FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",

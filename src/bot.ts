@@ -73,6 +73,9 @@ export interface WsStats {
 
 export type LogCallback = (message: string) => void;
 
+// Memory limits
+const MAX_LIMIT_FILLS_CACHE = 100;
+
 export class Bot {
   private trader: Trader;
   private config: BotConfig;
@@ -81,7 +84,7 @@ export class Bot {
   private onLog: LogCallback;
   private priceStream: PriceStream;
   private userStream: UserStream | null = null;
-  private wsLimitFills: Map<string, { filledShares: number; avgPrice: number }> = new Map();
+  private wsLimitFills: Map<string, { filledShares: number; avgPrice: number; timestamp: number }> = new Map();
   private pendingLimitFills: Set<string> = new Set();
   private wsPriceMaxAgeMs = 5000;
   private lastMarketRefresh: Date | null = null;
@@ -432,8 +435,8 @@ export class Bot {
       this.state.markets.push(market);
       this.state.markets.sort((a, b) => new Date(a.endDate).getTime() - new Date(b.endDate).getTime());
       this.log(`[WS] New BTC 15m market: ${slug}`);
-      this.subscribeToMarkets([market]).catch(() => {
-        // Ignore subscription errors
+      this.subscribeToMarkets([market]).catch((err) => {
+        this.log(`Error subscribing to new market: ${err instanceof Error ? err.message : err}`);
       });
     }
   }
@@ -466,13 +469,30 @@ export class Bot {
       ? (existing.avgPrice * prevShares + price * matchedShares) / totalShares
       : price;
 
-    this.wsLimitFills.set(orderId, { filledShares: totalShares, avgPrice });
+    // Enforce memory limit - clean up old entries
+    if (this.wsLimitFills.size >= MAX_LIMIT_FILLS_CACHE && !existing) {
+      this.cleanupOldLimitFills();
+    }
+
+    this.wsLimitFills.set(orderId, { filledShares: totalShares, avgPrice, timestamp: Date.now() });
 
     if (totalShares >= position.shares * 0.99) {
       this.wsLimitFills.delete(orderId);
-      this.processLimitFill(position, avgPrice, "WS").catch(() => {
-        // Ignore fill handling errors
+      this.processLimitFill(position, avgPrice, "WS").catch((err) => {
+        this.log(`Error processing limit fill: ${err instanceof Error ? err.message : err}`);
       });
+    }
+  }
+
+  /**
+   * Clean up old limit fill entries (older than 1 hour)
+   */
+  private cleanupOldLimitFills(): void {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    for (const [orderId, fill] of this.wsLimitFills) {
+      if (fill.timestamp < oneHourAgo) {
+        this.wsLimitFills.delete(orderId);
+      }
     }
   }
 
@@ -536,8 +556,8 @@ export class Bot {
 
     if (filled) {
       const price = parseFloat(event.price || "0") || this.getProfitTarget();
-      this.processLimitFill(position, price, "WS").catch(() => {
-        // Ignore fill handling errors
+      this.processLimitFill(position, price, "WS").catch((err) => {
+        this.log(`Error processing order fill: ${err instanceof Error ? err.message : err}`);
       });
     }
   }

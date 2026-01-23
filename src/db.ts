@@ -56,8 +56,13 @@ export function initDatabase(paperTrading: boolean, riskMode: "normal" | "super-
   // Add market_end_date column if it doesn't exist (for existing DBs)
   try {
     db.run("ALTER TABLE trades ADD COLUMN market_end_date TEXT");
-  } catch {
-    // Column already exists
+  } catch (err) {
+    // Column already exists - this is expected for existing databases
+    // Only log if it's an unexpected error
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (!errMsg.includes("duplicate column")) {
+      console.warn(`[DB] ALTER TABLE warning: ${errMsg}`);
+    }
   }
 
   console.log(`Database initialized: ${dbPath}`);

@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
 import type { BacktestConfig } from "./types";
-import { DEFAULT_BACKTEST_CONFIG, SUPER_RISK_CONFIG } from "./types";
+import { DEFAULT_BACKTEST_CONFIG, SUPER_RISK_CONFIG, SAFE_CONFIG, DYNAMIC_RISK_CONFIG } from "./types";
+import type { RiskMode } from "../bot";
 import { fetchHistoricalDataset, loadCachedDataset, getCacheStats } from "./data-fetcher";
 import { runBacktest, BacktestEngine } from "./engine";
 import {
@@ -60,7 +61,7 @@ OPTIONS:
   --spread <price>    Max spread (default: 0.03)
   --window <ms>       Time window in ms (default: 300000)
   --balance <amount>  Starting balance (default: 100)
-  --mode <mode>       Risk mode: normal or super-risk
+  --mode <mode>       Risk mode: normal, super-risk, dynamic-risk, or safe
   --quick             Use quick optimization (fewer combinations)
   --force             Force re-fetch data even if cached
   --export <file>     Export results to file (csv or json)
@@ -180,25 +181,114 @@ async function loadOrFetchMarkets(startDate: Date, endDate: Date): Promise<Retur
   return markets;
 }
 
+/**
+ * Validate backtest configuration
+ * Ensures parameters are within valid ranges and logically consistent
+ */
+function validateBacktestConfig(config: BacktestConfig): void {
+  const errors: string[] = [];
+
+  // Range validations
+  if (config.entryThreshold < 0.01 || config.entryThreshold > 0.99) {
+    errors.push(`entryThreshold must be between 0.01 and 0.99 (got ${config.entryThreshold})`);
+  }
+  if (config.maxEntryPrice < 0.01 || config.maxEntryPrice > 0.99) {
+    errors.push(`maxEntryPrice must be between 0.01 and 0.99 (got ${config.maxEntryPrice})`);
+  }
+  if (config.stopLoss < 0.01 || config.stopLoss > 0.99) {
+    errors.push(`stopLoss must be between 0.01 and 0.99 (got ${config.stopLoss})`);
+  }
+  if (config.profitTarget < 0.01 || config.profitTarget > 0.99) {
+    errors.push(`profitTarget must be between 0.01 and 0.99 (got ${config.profitTarget})`);
+  }
+  if (config.maxSpread < 0 || config.maxSpread > 0.50) {
+    errors.push(`maxSpread must be between 0 and 0.50 (got ${config.maxSpread})`);
+  }
+  if (config.slippage < 0 || config.slippage > 0.10) {
+    errors.push(`slippage must be between 0 and 0.10 (got ${config.slippage})`);
+  }
+  if (config.startingBalance <= 0) {
+    errors.push(`startingBalance must be positive (got ${config.startingBalance})`);
+  }
+
+  // Logical validations
+  if (config.entryThreshold >= config.maxEntryPrice) {
+    errors.push(`entryThreshold (${config.entryThreshold}) must be < maxEntryPrice (${config.maxEntryPrice})`);
+  }
+  if (config.stopLoss >= config.entryThreshold) {
+    errors.push(`stopLoss (${config.stopLoss}) must be < entryThreshold (${config.entryThreshold})`);
+  }
+  if (config.maxEntryPrice >= config.profitTarget) {
+    errors.push(`maxEntryPrice (${config.maxEntryPrice}) must be < profitTarget (${config.profitTarget})`);
+  }
+
+  // Risk mode validation
+  const validModes: RiskMode[] = ["normal", "super-risk", "dynamic-risk", "safe"];
+  if (!validModes.includes(config.riskMode)) {
+    errors.push(`riskMode must be one of: ${validModes.join(", ")} (got ${config.riskMode})`);
+  }
+
+  // Time window validation
+  if (config.timeWindowMs < 30000 || config.timeWindowMs > 900000) {
+    errors.push(`timeWindowMs must be between 30000 (30s) and 900000 (15m) (got ${config.timeWindowMs})`);
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Invalid backtest configuration:\n  - ${errors.join("\n  - ")}`);
+  }
+}
+
+/**
+ * Get preset config overrides for a risk mode
+ */
+function getPresetForMode(mode: RiskMode): Partial<BacktestConfig> {
+  switch (mode) {
+    case "super-risk":
+      return SUPER_RISK_CONFIG;
+    case "dynamic-risk":
+      return DYNAMIC_RISK_CONFIG;
+    case "safe":
+      return SAFE_CONFIG;
+    case "normal":
+    default:
+      return {};
+  }
+}
+
 // Build config from arguments (env config is the base, CLI args override)
 function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDate: Date, endDate: Date): BacktestConfig {
   const envConfig = getEnvConfig();
+  const mode = (args.mode || envConfig.mode) as RiskMode;
 
-  return {
-    entryThreshold: args.entry ? parseFloat(args.entry) : envConfig.entryThreshold,
-    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : envConfig.maxEntryPrice,
-    stopLoss: args.stop ? parseFloat(args.stop) : envConfig.stopLoss,
-    maxSpread: args.spread ? parseFloat(args.spread) : envConfig.maxSpread,
-    timeWindowMs: args.window ? parseInt(args.window, 10) : envConfig.timeWindowMs,
-    profitTarget: envConfig.profitTarget,
+  // Get preset overrides for the risk mode
+  const modePreset = getPresetForMode(mode);
+
+  // Build config: defaults < mode preset < env config < CLI args
+  const config: BacktestConfig = {
+    // Start with defaults
+    ...DEFAULT_BACKTEST_CONFIG,
+    // Apply mode preset
+    ...modePreset,
+    // Apply env/CLI values
+    entryThreshold: args.entry ? parseFloat(args.entry) : (modePreset.entryThreshold ?? envConfig.entryThreshold),
+    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : (modePreset.maxEntryPrice ?? envConfig.maxEntryPrice),
+    stopLoss: args.stop ? parseFloat(args.stop) : (modePreset.stopLoss ?? envConfig.stopLoss),
+    maxSpread: args.spread ? parseFloat(args.spread) : (modePreset.maxSpread ?? envConfig.maxSpread),
+    timeWindowMs: args.window ? parseInt(args.window, 10) : (modePreset.timeWindowMs ?? envConfig.timeWindowMs),
+    profitTarget: modePreset.profitTarget ?? envConfig.profitTarget,
     startingBalance: args.balance ? parseFloat(args.balance) : envConfig.startingBalance,
     slippage: DEFAULT_BACKTEST_CONFIG.slippage,
     compoundLimit: envConfig.compoundLimit,
     baseBalance: envConfig.baseBalance,
-    riskMode: (args.mode as "normal" | "super-risk" | "safe") || (envConfig.mode as "normal" | "super-risk" | "safe"),
+    riskMode: mode,
     startDate,
     endDate,
   };
+
+  // Validate the config
+  validateBacktestConfig(config);
+
+  return config;
 }
 
 // Command: run
@@ -355,7 +445,7 @@ async function commandCompare(args: ReturnType<typeof parseArguments>["values"])
 
   console.log(`\nComparing configurations on ${markets.length} markets...`);
 
-  // Build configs
+  // Build configs for all modes
   const normalConfig: BacktestConfig = {
     ...DEFAULT_BACKTEST_CONFIG,
     startDate,
@@ -363,7 +453,7 @@ async function commandCompare(args: ReturnType<typeof parseArguments>["values"])
     riskMode: "normal",
   };
 
-  const riskConfig: BacktestConfig = {
+  const superRiskConfig: BacktestConfig = {
     ...DEFAULT_BACKTEST_CONFIG,
     ...SUPER_RISK_CONFIG,
     startDate,
@@ -371,15 +461,49 @@ async function commandCompare(args: ReturnType<typeof parseArguments>["values"])
     riskMode: "super-risk",
   };
 
-  const comparisons = compareConfigs(markets, normalConfig, riskConfig, ["Normal Mode", "Super-Risk Mode"]);
+  const dynamicRiskConfig: BacktestConfig = {
+    ...DEFAULT_BACKTEST_CONFIG,
+    ...DYNAMIC_RISK_CONFIG,
+    startDate,
+    endDate,
+    riskMode: "dynamic-risk",
+  };
 
-  // Print comparison
-  printComparisonTable(comparisons);
+  const safeConfig: BacktestConfig = {
+    ...DEFAULT_BACKTEST_CONFIG,
+    ...SAFE_CONFIG,
+    startDate,
+    endDate,
+    riskMode: "safe",
+  };
+
+  // Run all backtests
+  console.log("\nRunning backtests for all modes...");
+  const results = [
+    { label: "Normal Mode", result: runBacktest(normalConfig, markets) },
+    { label: "Super-Risk Mode", result: runBacktest(superRiskConfig, markets) },
+    { label: "Dynamic-Risk Mode", result: runBacktest(dynamicRiskConfig, markets) },
+    { label: "Safe Mode", result: runBacktest(safeConfig, markets) },
+  ];
+
+  // Print comparison table
+  console.log("\n=== MODE COMPARISON ===\n");
+  console.log("Mode             | Trades | Win Rate | Total PnL | Max DD   | Sharpe");
+  console.log("-----------------+--------+----------+-----------+----------+--------");
+
+  for (const { label, result } of results) {
+    const m = result.metrics;
+    console.log(
+      `${label.padEnd(16)} | ${m.totalTrades.toString().padStart(6)} | ${(m.winRate * 100).toFixed(1).padStart(7)}% | $${m.totalPnL.toFixed(2).padStart(8)} | ${(m.maxDrawdownPercent * 100).toFixed(1).padStart(7)}% | ${m.sharpeRatio.toFixed(2).padStart(6)}`
+    );
+  }
+
+  console.log("");
 
   // Print individual results if verbose
-  for (const c of comparisons) {
-    console.log(`\n--- ${c.label} ---`);
-    printBacktestReport(c.result);
+  for (const { label, result } of results) {
+    console.log(`\n--- ${label} ---`);
+    printBacktestReport(result);
   }
 }
 
