@@ -176,7 +176,11 @@ export class PriceStream {
             console.log(`[WS] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
           }
           this.intentionalReconnect = false;
-          this.reconnectTimer = setTimeout(() => this.connect(), delay);
+          this.reconnectTimer = setTimeout(() => {
+            this.connect().catch((err) => {
+              console.error(`[WS] Reconnect failed: ${err instanceof Error ? err.message : err}`);
+            });
+          }, delay);
         };
 
       } catch (err) {
@@ -725,7 +729,11 @@ export class UserStream {
             console.log(`[UserWS] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
           }
           this.intentionalReconnect = false;
-          this.reconnectTimer = setTimeout(() => this.connect(), delay);
+          this.reconnectTimer = setTimeout(() => {
+            this.connect().catch((err) => {
+              console.error(`[UserWS] Reconnect failed: ${err instanceof Error ? err.message : err}`);
+            });
+          }, delay);
         };
       } catch (err) {
         reject(err);

@@ -5,8 +5,14 @@ import { clobLimiter } from "./rate-limiter";
 const CLOB_API = "https://clob.polymarket.com";
 const CHAIN_ID = 137; // Polygon
 
-// Polymarket minimum order size in shares (disabled)
-export const MIN_ORDER_SIZE = 0;
+// Polymarket minimum order size in shares
+export const MIN_ORDER_SIZE = 5;
+
+// Fee rate for orders (in basis points)
+// feeRateBps: ORDER_FEE_RATE_BPS means max acceptable fee is 10% (1000/10000)
+// This is a ceiling - actual fees are typically ~1% for takers
+// The CLOB API uses this as a slippage/fee tolerance parameter
+export const ORDER_FEE_RATE_BPS = 1000;
 
 // Signature types for different wallet types
 // 0 = EOA (MetaMask direct)
@@ -129,6 +135,12 @@ export class Trader {
     const positionBalance = await this.getPositionBalance(tokenId);
     const prefix = logPrefix ? `${logPrefix} ` : "";
 
+    // Handle API error
+    if (positionBalance === null) {
+      console.error(`${prefix}API error fetching position balance`);
+      return null;
+    }
+
     if (positionBalance < 0.01) {
       console.error(`${prefix}No position to sell (balance: ${positionBalance.toFixed(4)})`);
       return null;
@@ -153,7 +165,7 @@ export class Trader {
     return sharesToSell;
   }
 
-  async getBalance(): Promise<number> {
+  async getBalance(): Promise<number | null> {
     const client = this.ensureClient();
     // Get USDC balance from the exchange
     try {
@@ -165,15 +177,17 @@ export class Trader {
       // USDC has 6 decimals on Polygon - API returns raw micro-units
       // 22828636 micro-USDC = $22.83
       return rawBalance / 1_000_000;
-    } catch {
-      return 0;
+    } catch (err) {
+      console.error(`[Trader] getBalance API error: ${err instanceof Error ? err.message : err}`);
+      return null;
     }
   }
 
   /**
    * Get the position balance for a specific token (outcome shares owned)
+   * Returns null on API error (distinguish from actual 0 balance)
    */
-  async getPositionBalance(tokenId: string): Promise<number> {
+  async getPositionBalance(tokenId: string): Promise<number | null> {
     const client = this.ensureClient();
     try {
       await clobLimiter.acquire();
@@ -181,23 +195,40 @@ export class Trader {
         asset_type: "CONDITIONAL",
         token_id: tokenId
       });
+      // Conditional token balances are returned in shares (not micro-units)
+      // Note: USDC uses 6 decimals (micro-units), but conditional tokens don't
       const rawBalance = parseFloat(balances.balance || "0");
-      // Check if balance needs decimal conversion (> 1000 suggests micro-units)
-      return rawBalance > 1000 ? rawBalance / 1_000_000 : rawBalance;
-    } catch {
-      return 0;
+      return rawBalance;
+    } catch (err) {
+      console.error(`[Trader] getPositionBalance API error: ${err instanceof Error ? err.message : err}`);
+      return null;
     }
   }
 
   /**
    * Wait for position balance to be available (settlement)
+   * Returns true if position settled, false if timeout or API errors persist
    */
   async waitForPositionBalance(tokenId: string, minShares: number, timeoutMs: number = 15000): Promise<boolean> {
     const startTime = Date.now();
     const pollInterval = 1000; // Check every 1 second
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 3;
 
     while (Date.now() - startTime < timeoutMs) {
       const balance = await this.getPositionBalance(tokenId);
+
+      if (balance === null) {
+        consecutiveErrors++;
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          console.error(`[Trader] waitForPositionBalance: ${maxConsecutiveErrors} consecutive API errors`);
+          return false;
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        continue;
+      }
+
+      consecutiveErrors = 0;
       if (balance >= minShares * 0.99) { // Allow 1% tolerance for rounding
         return true;
       }
@@ -253,7 +284,7 @@ export class Trader {
         price,
         size: shares,
         side: Side.BUY,
-        feeRateBps: 1000
+        feeRateBps: ORDER_FEE_RATE_BPS
       });
 
       if (response.success) {
@@ -302,7 +333,7 @@ export class Trader {
           price,
           size: sharesToSell,
           side: Side.SELL,
-          feeRateBps: 1000
+          feeRateBps: ORDER_FEE_RATE_BPS
         });
 
         if (response.success) {
@@ -356,18 +387,24 @@ export class Trader {
         if (sharesToSell === null) return null;
 
         // Get current bid price for market sell (already rate limited)
-        const { bid } = await this.getPrice(tokenId);
+        const bidCheck = await this.checkBidValid(tokenId);
 
-        // Validate price is within Polymarket's allowed range (0.01 - 0.99)
-        if (bid < 0.01) {
-          console.error(`[STOP-LOSS] Bid price too low: $${bid.toFixed(4)} (min: 0.01) - market may have resolved`);
+        if (!bidCheck.valid) {
+          if (bidCheck.reason === "empty_book") {
+            console.error(`[STOP-LOSS] Order book empty (bid=0) - market may have resolved or no liquidity`);
+          } else {
+            console.error(`[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.01) - market may have resolved`);
+          }
+          // Don't retry if market is likely resolved - return null to trigger redemption flow
           return null;
         }
-        if (bid > 0.99) {
+
+        let validBid = bidCheck.bid;
+        if (validBid > 0.99) {
           // Cap at 0.99 (max allowed)
-          console.log(`[STOP-LOSS] Capping bid from $${bid.toFixed(2)} to $0.99`);
+          console.log(`[STOP-LOSS] Capping bid from $${validBid.toFixed(2)} to $0.99`);
+          validBid = 0.99;
         }
-        const validBid = Math.min(Math.max(bid, 0.01), 0.99);
 
         await clobLimiter.acquire();
         const response = await client.createAndPostOrder({
@@ -375,7 +412,7 @@ export class Trader {
           price: validBid,
           size: sharesToSell,
           side: Side.SELL,
-          feeRateBps: 1000
+          feeRateBps: ORDER_FEE_RATE_BPS
         });
 
         if (response.success) {
@@ -386,20 +423,23 @@ export class Trader {
         }
 
         if (this.isBalanceAllowanceError(response.errorMsg || "")) {
-          console.log(`[STOP-LOSS] Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          // Exponential backoff: 1s, 2s, 4s
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
+          console.log(`[STOP-LOSS] Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
 
-        console.error("Sell failed:", response.errorMsg);
+        console.error("[STOP-LOSS] Sell failed:", response.errorMsg);
         return null;
       } catch (err: any) {
         if (this.isBalanceAllowanceError(err?.toString() || "")) {
-          console.log(`[STOP-LOSS] Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
+          console.log(`[STOP-LOSS] Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
-        console.error("Sell error:", err);
+        console.error("[STOP-LOSS] Sell error:", err);
         return null;
       }
     }
@@ -495,15 +535,63 @@ export class Trader {
     return null;
   }
 
-  async cancelOrder(orderId: string): Promise<boolean> {
+  async cancelOrder(orderId: string, maxRetries: number = 3): Promise<boolean> {
     const client = this.ensureClient();
-    try {
-      await clobLimiter.acquire();
-      await client.cancelOrder({ orderID: orderId });
-      return true;
-    } catch {
-      return false;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await clobLimiter.acquire();
+        await client.cancelOrder({ orderID: orderId });
+        return true;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        // Check if order is already cancelled/filled (not an error)
+        if (errMsg.includes("not found") || errMsg.includes("already") || errMsg.includes("cancelled")) {
+          console.log(`[Trader] Order ${orderId.slice(0, 8)}... already cancelled/filled`);
+          return true;
+        }
+
+        console.error(`[Trader] cancelOrder attempt ${attempt}/${maxRetries} failed: ${errMsg}`);
+
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // Backoff
+        }
+      }
     }
+
+    console.error(`[Trader] cancelOrder FAILED after ${maxRetries} attempts: ${orderId.slice(0, 8)}...`);
+    return false;
+  }
+
+  /**
+   * Verify an order was cancelled by checking its status
+   */
+  async verifyOrderCancelled(orderId: string): Promise<boolean> {
+    const order = await this.getOrder(orderId);
+    if (!order) return true; // Not found = cancelled
+
+    const status = (order.status || "").toUpperCase();
+    return status === "CANCELLED" || status === "MATCHED" || status === "REJECTED";
+  }
+
+  /**
+   * Check if bid price is valid for selling (not an empty book or resolved market)
+   */
+  async checkBidValid(tokenId: string): Promise<{ valid: boolean; bid: number; reason?: string }> {
+    const { bid } = await this.getPrice(tokenId);
+
+    // Empty order book (bid = 0) - could be resolved market or no liquidity
+    if (bid === 0) {
+      return { valid: false, bid, reason: "empty_book" };
+    }
+
+    // Below minimum tradeable price - market likely resolved
+    if (bid < 0.01) {
+      return { valid: false, bid, reason: "below_minimum" };
+    }
+
+    return { valid: true, bid };
   }
 
   getAddress(): string {

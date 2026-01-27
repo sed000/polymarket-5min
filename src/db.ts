@@ -96,35 +96,48 @@ export interface Trade {
 }
 
 export function insertTrade(trade: Omit<Trade, "id" | "exit_price" | "pnl" | "closed_at" | "status">): number {
-  const database = ensureDb();
-  const stmt = database.prepare(`
-    INSERT INTO trades (market_slug, token_id, side, entry_price, shares, cost_basis, status, created_at, market_end_date)
-    VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-  `);
-  const result = stmt.run(
-    trade.market_slug,
-    trade.token_id,
-    trade.side,
-    trade.entry_price,
-    trade.shares,
-    trade.cost_basis,
-    trade.created_at,
-    trade.market_end_date
-  );
-  return Number(result.lastInsertRowid);
+  try {
+    const database = ensureDb();
+    const stmt = database.prepare(`
+      INSERT INTO trades (market_slug, token_id, side, entry_price, shares, cost_basis, status, created_at, market_end_date)
+      VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+    `);
+    const result = stmt.run(
+      trade.market_slug,
+      trade.token_id,
+      trade.side,
+      trade.entry_price,
+      trade.shares,
+      trade.cost_basis,
+      trade.created_at,
+      trade.market_end_date
+    );
+    return Number(result.lastInsertRowid);
+  } catch (err) {
+    console.error(`[DB] CRITICAL: Failed to insert trade: ${err instanceof Error ? err.message : err}`);
+    throw err; // Re-throw to ensure caller knows trade wasn't recorded
+  }
 }
 
 export function closeTrade(id: number, exitPrice: number, status: "STOPPED" | "RESOLVED"): void {
-  const trade = getTradeById(id);
-  if (!trade) return;
+  try {
+    const trade = getTradeById(id);
+    if (!trade) {
+      console.warn(`[DB] closeTrade called for non-existent trade ID: ${id}`);
+      return;
+    }
 
-  const database = ensureDb();
-  const pnl = (exitPrice - trade.entry_price) * trade.shares;
-  const stmt = database.prepare(`
-    UPDATE trades SET exit_price = ?, status = ?, pnl = ?, closed_at = ?
-    WHERE id = ?
-  `);
-  stmt.run(exitPrice, status, pnl, new Date().toISOString(), id);
+    const database = ensureDb();
+    const pnl = (exitPrice - trade.entry_price) * trade.shares;
+    const stmt = database.prepare(`
+      UPDATE trades SET exit_price = ?, status = ?, pnl = ?, closed_at = ?
+      WHERE id = ?
+    `);
+    stmt.run(exitPrice, status, pnl, new Date().toISOString(), id);
+  } catch (err) {
+    console.error(`[DB] CRITICAL: Failed to close trade ${id}: ${err instanceof Error ? err.message : err}`);
+    throw err; // Re-throw to ensure caller knows trade wasn't closed
+  }
 }
 
 export function getTradeById(id: number): Trade | null {
@@ -177,6 +190,20 @@ export function getLastClosedTrade(): Trade | null {
   const database = ensureDb();
   const stmt = database.prepare("SELECT * FROM trades WHERE status != 'OPEN' ORDER BY closed_at DESC LIMIT 1");
   return stmt.get() as Trade | null;
+}
+
+/**
+ * Get the last winning trade for a specific side in a specific market
+ * Used by opposite-side rule to prevent chasing after wins
+ */
+export function getLastWinningTradeInMarket(marketSlug: string, side: "UP" | "DOWN"): Trade | null {
+  const database = ensureDb();
+  const stmt = database.prepare(`
+    SELECT * FROM trades
+    WHERE market_slug = ? AND side = ? AND status != 'OPEN' AND pnl > 0
+    ORDER BY closed_at DESC LIMIT 1
+  `);
+  return stmt.get(marketSlug, side) as Trade | null;
 }
 
 // ============================================================================

@@ -1,6 +1,6 @@
 import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, fetchMarketResolution, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
-import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, type Trade } from "./db";
+import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, type Trade } from "./db";
 import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
 
 // Profit targets by risk mode
@@ -41,6 +41,7 @@ export interface Position {
 export interface BotState {
   running: boolean;
   balance: number;
+  reservedBalance: number;  // Balance reserved for in-flight orders (prevents overspend)
   savedProfit: number;  // Profit taken out via compound limit
   positions: Map<string, Position>;
   pendingEntries: Set<string>;  // Tokens with in-flight entry orders (prevents race conditions)
@@ -74,7 +75,12 @@ export interface WsStats {
 export type LogCallback = (message: string) => void;
 
 // Memory limits
-const MAX_LIMIT_FILLS_CACHE = 100;
+// Increased from 100 to 500 to reduce risk of missing profit exits
+const MAX_LIMIT_FILLS_CACHE = 500;
+
+// Paper trading fee simulation (Polymarket charges ~1% taker fee)
+// This makes paper trading results more realistic
+const PAPER_FEE_RATE = 0.01;  // 1% fee on each trade
 
 export class Bot {
   private trader: Trader;
@@ -98,6 +104,7 @@ export class Bot {
     this.state = {
       running: false,
       balance: config.paperTrading ? config.paperBalance : 0,
+      reservedBalance: 0,
       savedProfit: 0,
       positions: new Map(),
       pendingEntries: new Set(),
@@ -292,7 +299,14 @@ export class Bot {
 
       if (this.trader.isReady()) {
         this.state.tradingEnabled = true;
-        this.state.balance = await this.trader.getBalance();
+        const balance = await this.trader.getBalance();
+        if (balance === null) {
+          this.state.initError = "Failed to fetch wallet balance - check API connection";
+          this.state.tradingEnabled = false;
+          this.log("Trading disabled: API error fetching balance");
+          return;
+        }
+        this.state.balance = balance;
         this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
         await this.initUserStream();
 
@@ -300,7 +314,29 @@ export class Bot {
         const openTrades = getOpenTrades();
         for (const trade of openTrades) {
           // Verify position actually exists on Polymarket
-          const actualBalance = await this.trader.getPositionBalance(trade.token_id);
+          // Retry up to 3 times to distinguish API errors from actual 0 balance
+          let actualBalance: number | null = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            actualBalance = await this.trader.getPositionBalance(trade.token_id);
+            if (actualBalance !== null) break;
+            this.log(`Position check failed (attempt ${attempt}/3), retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+
+          // API error after all retries - keep position in DB, don't close
+          if (actualBalance === null) {
+            this.log(`Warning: Cannot verify position ${trade.side} - keeping in DB (API error)`);
+            this.state.positions.set(trade.token_id, {
+              tradeId: trade.id,
+              tokenId: trade.token_id,
+              shares: trade.shares, // Use DB value since API failed
+              entryPrice: trade.entry_price,
+              side: trade.side as "UP" | "DOWN",
+              marketSlug: trade.market_slug,
+              marketEndDate: this.parseMarketEndDate(trade)
+            });
+            continue;
+          }
 
           if (actualBalance < 0.01) {
             // Position doesn't exist - was sold manually or resolved
@@ -380,6 +416,14 @@ export class Bot {
       this.state.logs.shift();
     }
     this.onLog(formatted);
+  }
+
+  /**
+   * Get available balance (total balance minus reserved for in-flight orders)
+   * This prevents multiple concurrent signals from overspending
+   */
+  private getAvailableBalance(): number {
+    return Math.max(0, this.state.balance - this.state.reservedBalance);
   }
 
   private handleMarketEvent(event: MarketEvent): void {
@@ -515,7 +559,10 @@ export class Bot {
 
       this.log(`[${source}] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
       this.logDynamicStreak(true);
-      this.state.balance = await this.trader.getBalance();
+      const newBalance = await this.trader.getBalance();
+      if (newBalance !== null) {
+        this.state.balance = newBalance;
+      }
     } finally {
       this.pendingLimitFills.delete(position.tokenId);
     }
@@ -719,7 +766,9 @@ export class Bot {
       // In paper mode, balance is managed internally
       if (!this.config.paperTrading) {
         const walletBalance = await this.trader.getBalance();
-        this.applyCompoundLimit(walletBalance);
+        if (walletBalance !== null) {
+          this.applyCompoundLimit(walletBalance);
+        }
       }
 
       // Check for limit order fills (profit taking)
@@ -812,7 +861,10 @@ export class Bot {
               this.state.consecutiveLosses = 0;
 
               this.log(`Profit taken @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-              this.state.balance = await this.trader.getBalance();
+              const newBalance = await this.trader.getBalance();
+              if (newBalance !== null) {
+                this.state.balance = newBalance;
+              }
             }
           } else if (!position.limitOrderId) {
             // Try to place limit order if we don't have one
@@ -888,17 +940,17 @@ export class Bot {
           this.logDynamicStreak(pnl > 0);
           this.checkCompoundLimit();
         } else {
-          // Real trading: cancel limit order then market sell at actual price
+          // Real trading: try market sell at actual price, then cancel limit order
           try {
-            // Cancel the limit order if it exists
-            if (position.limitOrderId) {
-              await this.trader.cancelOrder(position.limitOrderId);
-              this.log(`Cancelled unfilled limit order`);
-            }
-
             // Market sell at actual bid price
             const result = await this.trader.marketSell(tokenId, position.shares);
             if (result) {
+              // Only cancel limit order AFTER successful sell
+              if (position.limitOrderId) {
+                await this.trader.cancelOrder(position.limitOrderId);
+                this.log(`Cancelled unfilled limit order`);
+              }
+
               closeTrade(position.tradeId, result.price, "RESOLVED");
               this.state.positions.delete(tokenId);
               const realPnl = (result.price - position.entryPrice) * position.shares;
@@ -916,7 +968,13 @@ export class Bot {
               this.logDynamicStreak(realPnl > 0);
 
               // Sync balance after exit
-              this.state.balance = await this.trader.getBalance();
+              const newBalance = await this.trader.getBalance();
+              if (newBalance !== null) {
+                this.state.balance = newBalance;
+              }
+            } else {
+              // Market sell failed - keep limit order as fallback
+              this.log(`Market sell failed for expired position, keeping limit order`);
             }
           } catch (err) {
             this.log(`Error selling expired position: ${err}`);
@@ -987,15 +1045,24 @@ export class Bot {
 
         this.checkCompoundLimit();
       } else {
-        // Real trading: cancel limit order then market sell
+        // Real trading: market sell FIRST, then cancel limit order
+        // This ensures position stays protected if sell fails
         try {
-          if (position.limitOrderId) {
-            await this.trader.cancelOrder(position.limitOrderId);
-            this.log(`Cancelled limit order`);
+          // SECURITY FIX: Skip stop-loss on empty order book (bid = 0)
+          // This prevents triggering on temporary book clearing
+          if (currentBid === 0) {
+            this.log(`[STOP-LOSS] Skipping: order book empty (bid = 0)`);
+            return;
           }
 
           const result = await this.trader.marketSell(tokenId, position.shares);
           if (result) {
+            // Only cancel limit order AFTER successful sell
+            if (position.limitOrderId) {
+              await this.trader.cancelOrder(position.limitOrderId);
+              this.log(`Cancelled limit order`);
+            }
+
             closeTrade(position.tradeId, result.price, "STOPPED");
             this.state.positions.delete(tokenId);
             const pnl = (result.price - position.entryPrice) * position.shares;
@@ -1007,7 +1074,13 @@ export class Bot {
             this.logDynamicStreak(false);
 
             // Sync balance after exit
-            this.state.balance = await this.trader.getBalance();
+            const newBalance = await this.trader.getBalance();
+            if (newBalance !== null) {
+              this.state.balance = newBalance;
+            }
+          } else {
+            // Sell failed - keep limit order as fallback protection
+            this.log(`[STOP-LOSS] Sell failed, keeping limit order as protection`);
           }
         } catch (err) {
           this.log(`Error executing stop-loss: ${err}`);
@@ -1166,7 +1239,10 @@ export class Bot {
 
     try {
       // Check position limit (prevent excessive risk exposure)
-      if (this.state.positions.size >= this.config.maxPositions) {
+      // Include pendingEntries in count to prevent race condition where multiple signals
+      // all pass the check simultaneously before any position is recorded
+      const currentPositionCount = this.state.positions.size + this.state.pendingEntries.size - 1; // -1 because we already added this tokenId
+      if (currentPositionCount >= this.config.maxPositions) {
         this.log(`Skipping: max positions (${this.config.maxPositions}) reached`);
         return;
       }
@@ -1208,19 +1284,14 @@ export class Bot {
         dynamicStopLoss = askPrice * (1 - activeConfig.maxDrawdownPercent);
       }
 
-      // Only enter OPPOSITE side of last closed trade IN THE SAME MARKET
-      // BUT only if that trade was a WIN (positive PnL) - not a stop-loss
+      // Only enter OPPOSITE side of last WINNING trade IN THE SAME MARKET for the same side
       // This prevents chasing the same direction after it already won
       // But allows re-entry after a stop-loss (give it another chance)
-      const lastTrade = getLastClosedTrade();
-      if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
-        // Check actual PnL - more reliable than comparing exit price to target
-        if (lastTrade.pnl && lastTrade.pnl > 0) {
-          this.log(`Skipping: already won ${side} with +$${lastTrade.pnl.toFixed(2)} in this market`);
-          return;
-        }
-        // If stopped out (negative PnL), allow re-entry
-        this.log(`Re-entering ${side} after loss (prev PnL: $${lastTrade.pnl?.toFixed(2) || 'unknown'})`);
+      // Uses market-specific lookup instead of just last trade globally
+      const lastWinningTrade = getLastWinningTradeInMarket(market.slug, side);
+      if (lastWinningTrade) {
+        this.log(`Skipping: already won ${side} with +$${lastWinningTrade.pnl?.toFixed(2) || '?'} in this market`);
+        return;
       }
 
       const stopInfo = dynamicStopLoss ? ` (stop: $${dynamicStopLoss.toFixed(2)})` : "";
@@ -1228,146 +1299,177 @@ export class Bot {
 
       if (this.config.paperTrading) {
         // Paper trading: simulate buy at ask price
-        const balance = this.state.balance;
-        if (balance < 1) {
+        const availableBalance = this.getAvailableBalance();
+        if (availableBalance < 1) {
           this.log("Insufficient paper balance");
           return;
         }
 
-        // Calculate shares: balance / askPrice
-        const shares = balance / askPrice;
+        // Reserve the balance to prevent concurrent overspending
+        this.state.reservedBalance += availableBalance;
 
-        // Check minimum order size (Polymarket requires at least 5 shares)
-        if (shares < MIN_ORDER_SIZE) {
-          const minUsdc = MIN_ORDER_SIZE * askPrice;
-          this.log(`[PAPER] Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${balance.toFixed(2)})`);
-          return;
+        try {
+          // Calculate shares: balance / askPrice
+          const rawShares = availableBalance / askPrice;
+          // Apply paper trading fee (simulates Polymarket's ~1% taker fee)
+          const shares = rawShares * (1 - PAPER_FEE_RATE);
+
+          // Check minimum order size (Polymarket requires at least 5 shares)
+          if (shares < MIN_ORDER_SIZE) {
+            const minUsdc = MIN_ORDER_SIZE * askPrice / (1 - PAPER_FEE_RATE);
+            this.log(`[PAPER] Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${availableBalance.toFixed(2)})`);
+            return;
+          }
+
+          // Record paper trade
+          const tradeId = insertTrade({
+            market_slug: market.slug,
+            token_id: tokenId,
+            side,
+            entry_price: askPrice,
+            shares,
+            cost_basis: availableBalance,
+            created_at: new Date().toISOString(),
+            market_end_date: endDate.toISOString()
+          });
+
+          this.state.positions.set(tokenId, {
+            tradeId,
+            tokenId,
+            shares,
+            entryPrice: askPrice,
+            side,
+            marketSlug: market.slug,
+            marketEndDate: endDate,
+            limitOrderId: "paper-limit-" + tradeId, // Simulated limit order
+            dynamicStopLoss
+          });
+
+          // Deduct from paper balance
+          this.state.balance -= availableBalance;
+
+          this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask (fee: ${(PAPER_FEE_RATE * 100).toFixed(1)}%)`);
+          this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
+        } finally {
+          // Release the reserved balance
+          this.state.reservedBalance -= availableBalance;
         }
-
-        // Record paper trade
-        const tradeId = insertTrade({
-          market_slug: market.slug,
-          token_id: tokenId,
-          side,
-          entry_price: askPrice,
-          shares,
-          cost_basis: balance,
-          created_at: new Date().toISOString(),
-          market_end_date: endDate.toISOString()
-        });
-
-        this.state.positions.set(tokenId, {
-          tradeId,
-          tokenId,
-          shares,
-          entryPrice: askPrice,
-          side,
-          marketSlug: market.slug,
-          marketEndDate: endDate,
-          limitOrderId: "paper-limit-" + tradeId, // Simulated limit order
-          dynamicStopLoss
-        });
-
-        // Deduct from paper balance
-        this.state.balance = 0;
-
-        this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
-        this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
       } else {
         // Real trading - use compound-limited balance (set by applyCompoundLimit in tick)
-        const balance = this.state.balance;
-        if (balance < 1) {
+        const availableBalance = this.getAvailableBalance();
+        if (availableBalance < 1) {
           this.log("Insufficient balance");
           return;
         }
 
         // Check minimum order size before attempting trade
-        const estimatedShares = balance / askPrice;
+        const estimatedShares = availableBalance / askPrice;
         if (estimatedShares < MIN_ORDER_SIZE) {
           const minUsdc = MIN_ORDER_SIZE * askPrice;
-          this.log(`Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${balance.toFixed(2)})`);
+          this.log(`Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${availableBalance.toFixed(2)})`);
           return;
         }
 
-        const result = await this.trader.buy(tokenId, askPrice, balance);
-        if (!result) {
-          this.log("Order failed");
-          return;
+        // Reserve the balance to prevent concurrent overspending
+        this.state.reservedBalance += availableBalance;
+
+        try {
+          const result = await this.trader.buy(tokenId, askPrice, availableBalance);
+          if (!result) {
+            this.log("Order failed");
+            return;
+          }
+
+          // Wait for order to fill (with 10s timeout)
+          this.log(`Order placed, waiting for fill...`);
+          const fillInfo = await this.trader.waitForFill(result.orderId, 10000);
+
+          if (!fillInfo || fillInfo.filledShares <= 0) {
+            // Order didn't fill - cancel it and abort
+            this.log("Order did not fill, cancelling...");
+            await this.trader.cancelOrder(result.orderId);
+            return;
+          }
+
+          // Use actual fill data instead of assumed values
+          const actualShares = fillInfo.filledShares;
+          const actualEntryPrice = fillInfo.avgPrice || askPrice;
+          const actualCost = actualShares * actualEntryPrice;
+
+          this.log(`Order filled: ${actualShares.toFixed(2)} shares @ $${actualEntryPrice.toFixed(2)}`);
+
+          // Wait for position to settle before placing limit sell
+          this.log(`Waiting for position settlement...`);
+          await new Promise(resolve => setTimeout(resolve, 3000)); // 3s initial delay
+
+          // Get ACTUAL position balance (may differ from calculated due to fees)
+          // Use polling to wait for settlement (API may take time to reflect new position)
+          let actualPositionBalance: number | null = null;
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            actualPositionBalance = await this.trader.getPositionBalance(tokenId);
+            if (actualPositionBalance !== null && actualPositionBalance > 0) break;
+            if (attempt < 5) {
+              await new Promise(resolve => setTimeout(resolve, 1000)); // 1s between attempts
+            }
+          }
+          const sharesToSell = (actualPositionBalance !== null && actualPositionBalance > 0)
+            ? actualPositionBalance
+            : actualShares;
+
+          if (Math.abs(sharesToSell - actualShares) > 0.01) {
+            this.log(`Adjusted shares: ${actualShares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
+          }
+
+          // Place limit sell order at profit target (with retry logic)
+          let limitOrderId: string | undefined;
+          const limitResult = await this.trader.limitSell(tokenId, sharesToSell, this.getProfitTarget());
+          if (limitResult) {
+            limitOrderId = limitResult.orderId;
+            this.log(`Placed limit sell @ $${this.getProfitTarget().toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
+          } else {
+            this.log("WARNING: Limit sell FAILED - position will only exit via stop-loss or expiry");
+          }
+
+          // Record trade with actual position balance (accounts for fees)
+          const tradeId = insertTrade({
+            market_slug: market.slug,
+            token_id: tokenId,
+            side,
+            entry_price: actualEntryPrice,
+            shares: sharesToSell, // Use actual position balance, not calculated
+            cost_basis: actualCost,
+            created_at: new Date().toISOString(),
+            market_end_date: endDate.toISOString()
+          });
+
+          // Recalculate dynamic stop-loss with actual entry price
+          let actualDynamicStopLoss: number | undefined;
+          if (this.config.riskMode === "dynamic-risk" && activeConfig.maxDrawdownPercent > 0) {
+            actualDynamicStopLoss = actualEntryPrice * (1 - activeConfig.maxDrawdownPercent);
+          }
+
+          this.state.positions.set(tokenId, {
+            tradeId,
+            tokenId,
+            shares: sharesToSell, // Use actual position balance for stop-loss
+            entryPrice: actualEntryPrice,
+            side,
+            marketSlug: market.slug,
+            marketEndDate: endDate,
+            limitOrderId,
+            dynamicStopLoss: actualDynamicStopLoss
+          });
+
+          // Sync balance after trade
+          const newBalance = await this.trader.getBalance();
+          if (newBalance !== null) {
+            this.state.balance = newBalance;
+          }
+          this.log(`Balance after trade: $${this.state.balance.toFixed(2)}`);
+        } finally {
+          // Release reserved balance
+          this.state.reservedBalance -= availableBalance;
         }
-
-        // Wait for order to fill (with 10s timeout)
-        this.log(`Order placed, waiting for fill...`);
-        const fillInfo = await this.trader.waitForFill(result.orderId, 10000);
-
-        if (!fillInfo || fillInfo.filledShares <= 0) {
-          // Order didn't fill - cancel it and abort
-          this.log("Order did not fill, cancelling...");
-          await this.trader.cancelOrder(result.orderId);
-          return;
-        }
-
-        // Use actual fill data instead of assumed values
-        const actualShares = fillInfo.filledShares;
-        const actualEntryPrice = fillInfo.avgPrice || askPrice;
-        const actualCost = actualShares * actualEntryPrice;
-
-        this.log(`Order filled: ${actualShares.toFixed(2)} shares @ $${actualEntryPrice.toFixed(2)}`);
-
-        // Wait for position to settle before placing limit sell
-        this.log(`Waiting for position settlement...`);
-        await new Promise(resolve => setTimeout(resolve, 3000)); // 3s initial delay
-
-        // Get ACTUAL position balance (may differ from calculated due to fees)
-        const actualPositionBalance = await this.trader.getPositionBalance(tokenId);
-        const sharesToSell = actualPositionBalance > 0 ? actualPositionBalance : actualShares;
-
-        if (Math.abs(sharesToSell - actualShares) > 0.01) {
-          this.log(`Adjusted shares: ${actualShares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
-        }
-
-        // Place limit sell order at profit target (with retry logic)
-        let limitOrderId: string | undefined;
-        const limitResult = await this.trader.limitSell(tokenId, sharesToSell, this.getProfitTarget());
-        if (limitResult) {
-          limitOrderId = limitResult.orderId;
-          this.log(`Placed limit sell @ $${this.getProfitTarget().toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
-        } else {
-          this.log("WARNING: Limit sell FAILED - position will only exit via stop-loss or expiry");
-        }
-
-        // Record trade with actual position balance (accounts for fees)
-        const tradeId = insertTrade({
-          market_slug: market.slug,
-          token_id: tokenId,
-          side,
-          entry_price: actualEntryPrice,
-          shares: sharesToSell, // Use actual position balance, not calculated
-          cost_basis: actualCost,
-          created_at: new Date().toISOString(),
-          market_end_date: endDate.toISOString()
-        });
-
-        // Recalculate dynamic stop-loss with actual entry price
-        let actualDynamicStopLoss: number | undefined;
-        if (this.config.riskMode === "dynamic-risk" && activeConfig.maxDrawdownPercent > 0) {
-          actualDynamicStopLoss = actualEntryPrice * (1 - activeConfig.maxDrawdownPercent);
-        }
-
-        this.state.positions.set(tokenId, {
-          tradeId,
-          tokenId,
-          shares: sharesToSell, // Use actual position balance for stop-loss
-          entryPrice: actualEntryPrice,
-          side,
-          marketSlug: market.slug,
-          marketEndDate: endDate,
-          limitOrderId,
-          dynamicStopLoss: actualDynamicStopLoss
-        });
-
-        // Sync balance after trade
-        this.state.balance = await this.trader.getBalance();
-        this.log(`Balance after trade: $${this.state.balance.toFixed(2)}`);
       }
     } finally {
       // MUTEX: Always release the lock
