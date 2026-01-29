@@ -1,4 +1,4 @@
-import type { RiskMode } from "../bot";
+import type { RiskMode } from "../config";
 
 // Configuration for a single backtest run
 export interface BacktestConfig {
@@ -239,7 +239,7 @@ export const DYNAMIC_RISK_CONFIG: Partial<BacktestConfig> = {
   riskMode: "dynamic-risk",
 };
 
-// Dynamic-risk constants (matching bot.ts)
+// Dynamic-risk constants (defaults - can be overridden in trading.config.json)
 export const DYNAMIC_RISK_BASE_THRESHOLD = 0.70;
 export const DYNAMIC_RISK_THRESHOLD_INCREMENT = 0.05;
 export const DYNAMIC_RISK_MAX_THRESHOLD = 0.85;

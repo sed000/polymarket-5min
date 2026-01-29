@@ -3,26 +3,26 @@ import { render, Box, Text, useInput, useApp } from "ink";
 import { Bot, type BotConfig, type BotState, type WsStats } from "./bot";
 import { getRecentTrades, getTotalPnL, getTradeStats, type Trade } from "./db";
 import { formatTimeRemaining, type EligibleMarket } from "./scanner";
+import { type ConfigManager, isDynamicMode } from "./config";
 
 interface AppProps {
   bot: Bot;
 }
 
-function Header({ state, config }: { state: BotState; config: BotConfig }) {
-  const isSuperRisk = config.riskMode === "super-risk";
-  const isDynamicRisk = config.riskMode === "dynamic-risk";
-  const isSafe = config.riskMode === "safe";
-  const borderColor = isDynamicRisk ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : state.paperTrading ? "yellow" : "cyan";
+function Header({ state, config, configManager }: { state: BotState; config: BotConfig; configManager: ConfigManager }) {
+  const modeName = configManager.getActiveModeName();
+  const mode = configManager.getActiveMode();
+  const isDynamic = isDynamicMode(mode);
+  const isSuperRisk = modeName === "super-risk";
+  const isSafe = modeName === "safe";
+  const borderColor = isDynamic ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : state.paperTrading ? "yellow" : "cyan";
 
-  // Get active config values based on risk mode
-  // Claude-mode: dynamic entry threshold based on consecutive losses
-  const dynamicBaseThreshold = 0.70;
-  const dynamicLossAdjustment = Math.min(state.consecutiveLosses * 0.05, 0.15);
-  const dynamicThreshold = dynamicBaseThreshold + dynamicLossAdjustment;
-
-  const activeEntry = isDynamicRisk ? dynamicThreshold : isSuperRisk ? 0.70 : isSafe ? 0.95 : config.entryThreshold;
-  const activeMaxEntry = isDynamicRisk ? 0.95 : isSuperRisk ? 0.95 : isSafe ? 0.98 : config.maxEntryPrice;
-  const activeStop = isDynamicRisk ? "dynamic" : isSuperRisk ? 0.40 : isSafe ? 0.90 : config.stopLoss;
+  // Get active config values from ConfigManager
+  const activeEntry = isDynamic
+    ? configManager.getDynamicEntryThreshold(state.consecutiveLosses)
+    : mode.entryThreshold;
+  const activeMaxEntry = mode.maxEntryPrice;
+  const activeStop = isDynamic ? "dynamic" : mode.stopLoss;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
@@ -37,8 +37,11 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
           {isSuperRisk && (
             <Text color="magenta" bold>SUPER-RISK</Text>
           )}
-          {isDynamicRisk && (
+          {isDynamic && (
             <Text color="blue" bold>DYNAMIC</Text>
+          )}
+          {!isSafe && !isSuperRisk && !isDynamic && modeName !== "normal" && (
+            <Text color="cyan" bold>{modeName.toUpperCase()}</Text>
           )}
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
@@ -69,10 +72,10 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
         {state.savedProfit > 0 && (
           <Text>Saved: <Text color="cyan">${state.savedProfit.toFixed(2)}</Text></Text>
         )}
-        <Text>Entry: <Text color={isDynamicRisk ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
-        <Text>Stop: <Text color="red">{isDynamicRisk ? "32.5%" : `≤$${activeStop.toFixed(2)}`}</Text></Text>
+        <Text>Entry: <Text color={isDynamic ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
+        <Text>Stop: <Text color="red">{isDynamic ? `${((isDynamicMode(mode) ? mode.maxDrawdownPercent : 0) * 100).toFixed(1)}%` : `≤$${(activeStop as number).toFixed(2)}`}</Text></Text>
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
-        {isDynamicRisk && (
+        {isDynamic && (
           <Text>
             Streak: <Text color={state.consecutiveLosses > 0 ? "red" : "green"}>
               {state.consecutiveLosses > 0 ? `L${state.consecutiveLosses}` : `W${state.consecutiveWins}`}
@@ -130,14 +133,13 @@ function MarketsTable({ markets }: { markets: EligibleMarket[] }) {
   );
 }
 
-function PositionsTable({ state, config }: { state: BotState; config: BotConfig }) {
+function PositionsTable({ state, configManager }: { state: BotState; configManager: ConfigManager }) {
   const positions = Array.from(state.positions.values());
 
-  // Get active stop-loss based on risk mode
-  const isSuperRisk = config.riskMode === "super-risk";
-  const isDynamicRisk = config.riskMode === "dynamic-risk";
-  const defaultStopLoss = isSuperRisk ? 0.40 : config.stopLoss;
-  const profitTarget = 0.99;
+  // Get active stop-loss and profit target from config
+  const mode = configManager.getActiveMode();
+  const defaultStopLoss = mode.stopLoss;
+  const profitTarget = mode.profitTarget;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1} marginTop={1}>
@@ -334,6 +336,7 @@ function Controls() {
 
 function App({ bot }: AppProps) {
   const { exit } = useApp();
+  const configManager = bot.getConfigManager();
   const [state, setState] = useState<BotState>(bot.getState());
   const [wsStats, setWsStats] = useState<WsStats>(bot.getWsStats());
   const [markets, setMarkets] = useState<EligibleMarket[]>([]);
@@ -404,11 +407,11 @@ function App({ bot }: AppProps) {
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Header state={state} config={bot.getConfig()} />
+      <Header state={state} config={bot.getConfig()} configManager={configManager} />
       <Box>
         <Box flexDirection="column" width="50%">
           <MarketsTable markets={markets} />
-          <PositionsTable state={state} config={bot.getConfig()} />
+          <PositionsTable state={state} configManager={configManager} />
           <Logs logs={state.logs} scrollOffset={logScrollOffset} autoScroll={autoScroll} />
         </Box>
         <Box flexDirection="column" width="50%" marginLeft={1}>

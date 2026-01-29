@@ -19,8 +19,11 @@ const DB_PATHS: Record<string, string> = {
   "normal": "trades_paper_normal.db"
 };
 
-export function initDatabase(paperTrading: boolean, riskMode: "normal" | "super-risk" | "dynamic-risk" | "safe"): void {
-  const dbPath = paperTrading ? (DB_PATHS[riskMode] || DB_PATHS.normal) : DB_PATHS.real;
+export function initDatabase(paperTrading: boolean, riskMode: string): void {
+  // Map known risk modes to their DB paths, fall back to custom mode path for unknown modes
+  const dbPath = paperTrading
+    ? (DB_PATHS[riskMode as keyof typeof DB_PATHS] || `trades_paper_${riskMode}.db`)
+    : DB_PATHS.real;
 
   // Skip if already using this database
   if (currentDbPath === dbPath && db) {

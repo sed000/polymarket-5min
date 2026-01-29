@@ -42,7 +42,9 @@ bun run backtest:history  # View historical runs
 
 ### Core Components
 
-**src/index.ts** - Entry point. Loads environment config, validates parameters, initializes database, creates Bot instance, and renders terminal UI.
+**src/config.ts** - Configuration manager with hot-reload support. Loads `trading.config.json`, validates settings, emits change events for live updates.
+
+**src/index.ts** - Entry point. Loads configuration from `trading.config.json`, initializes database, creates Bot instance, and renders terminal UI.
 
 **src/bot.ts** - Main trading logic (`Bot` class):
 - Position management with mutex-protected entry/exit to prevent race conditions
@@ -78,24 +80,76 @@ bun run backtest:history  # View historical runs
 
 ## Key Configuration
 
-Environment variables control trading behavior (see `.env.example`):
-- `PAPER_TRADING` - Enable paper trading mode
-- `PAPER_BALANCE` - Starting balance for paper trading (default: 100)
-- `RISK_MODE` - "normal", "super-risk", or "dynamic-risk"
-- `MAX_POSITIONS` - Maximum concurrent positions (default: 1)
-- `ENTRY_THRESHOLD` - Minimum price to enter (e.g., 0.95)
-- `MAX_ENTRY_PRICE` - Maximum price to enter (e.g., 0.98)
-- `STOP_LOSS` - Exit trigger price (e.g., 0.80)
-- `COMPOUND_LIMIT` / `BASE_BALANCE` - Profit taking system
-- `SIGNATURE_TYPE` - 0=EOA, 1=Magic.link proxy, 2=Gnosis Safe
+Configuration is stored in `trading.config.json` with hot-reload support. Edit the file while the bot is running and changes apply immediately.
 
-### Backtest-Specific Variables
-- `BACKTEST_MODE` - Risk mode for backtesting
-- `BACKTEST_ENTRY_THRESHOLD` / `BACKTEST_MAX_ENTRY_PRICE` - Entry prices
-- `BACKTEST_STOP_LOSS` - Stop-loss threshold
-- `BACKTEST_PROFIT_TARGET` - Target exit price (default: 0.98)
-- `BACKTEST_MAX_SPREAD` / `BACKTEST_TIME_WINDOW_MINS` - Filters
-- `BACKTEST_STARTING_BALANCE` / `BACKTEST_DAYS` - Simulation settings
+### Config File Structure (`trading.config.json`)
+```json
+{
+  "trading": {
+    "paperTrading": true,       // Enable paper trading mode
+    "paperBalance": 100,        // Starting balance for paper trading
+    "maxPositions": 1,          // Max concurrent positions
+    "pollIntervalMs": 10000     // Market scan interval
+  },
+  "wallet": {
+    "signatureType": 0,         // 0=EOA, 1=Magic.link proxy, 2=Gnosis Safe
+    "funderAddress": null       // Required for signature type 1
+  },
+  "profitTaking": {
+    "compoundLimit": 0,         // Take profit when balance exceeds this (0=disabled)
+    "baseBalance": 10           // Reset to this after taking profit
+  },
+  "activeMode": "normal",       // Current trading mode
+  "modes": {
+    "normal": { ... },          // Built-in mode presets
+    "safe": { ... },
+    "super-risk": { ... },
+    "dynamic-risk": { ... },
+    "my-custom": { ... }        // Custom modes allowed
+  },
+  "backtest": {
+    "mode": "normal",           // Mode to use for backtesting
+    "startingBalance": 100,
+    "days": 7,
+    "slippage": 0.001
+  },
+  "advanced": {
+    "wsPriceMaxAgeMs": 5000,
+    "marketRefreshInterval": 30000,
+    "paperFeeRate": 0.01
+  }
+}
+```
+
+### Mode Configuration
+Each mode defines trading parameters:
+- `entryThreshold` - Minimum price to enter (e.g., 0.95)
+- `maxEntryPrice` - Maximum price to enter (e.g., 0.98)
+- `stopLoss` - Exit trigger price (e.g., 0.80)
+- `profitTarget` - Limit order price for profit taking
+- `maxSpread` - Max bid-ask spread to accept
+- `timeWindowMs` - Time remaining before market close to enter
+
+Dynamic-risk mode has additional parameters:
+- `baseThreshold`, `thresholdIncrement`, `maxThreshold` - Adaptive entry
+- `maxDrawdownPercent` - Position-relative stop-loss (e.g., 0.325 = 32.5%)
+
+### Environment Variables
+Only secrets remain in `.env`:
+- `PRIVATE_KEY` - Wallet private key (required for real trading)
+- `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE` - API credentials
+
+### Hot-Reload Behavior
+**Safe to change live:**
+- `activeMode` - Switch between modes instantly
+- Mode parameters (thresholds, stops, spreads)
+- `compoundLimit`, `baseBalance`
+- `maxPositions` (affects new entries only)
+- `pollIntervalMs` (restarts polling)
+
+**Require restart:**
+- `paperTrading` (changes database)
+- `signatureType`, `funderAddress` (wallet config)
 
 ## Important Patterns
 

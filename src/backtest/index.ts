@@ -2,7 +2,7 @@
 import { parseArgs } from "util";
 import type { BacktestConfig } from "./types";
 import { DEFAULT_BACKTEST_CONFIG, SUPER_RISK_CONFIG, SAFE_CONFIG, DYNAMIC_RISK_CONFIG } from "./types";
-import type { RiskMode } from "../bot";
+import { type RiskMode, getConfigManager, isDynamicMode } from "../config";
 import { fetchHistoricalDataset, loadCachedDataset, getCacheStats } from "./data-fetcher";
 import { runBacktest, BacktestEngine } from "./engine";
 import {
@@ -131,28 +131,38 @@ function parseArguments() {
   return { values, positionals };
 }
 
-// Load backtest config from environment
-function getEnvConfig() {
+// Load backtest config from trading.config.json
+function getConfigFromFile() {
+  const configManager = getConfigManager();
+  const backtestConfig = configManager.getBacktestConfig();
+  const mode = configManager.getMode(backtestConfig.mode);
+  const profitTaking = configManager.getConfig().profitTaking;
+
+  if (!mode) {
+    throw new Error(`Backtest mode "${backtestConfig.mode}" not found in config file`);
+  }
+
   return {
-    mode: process.env.BACKTEST_MODE || "normal",
-    entryThreshold: parseFloat(process.env.BACKTEST_ENTRY_THRESHOLD || "0.95"),
-    maxEntryPrice: parseFloat(process.env.BACKTEST_MAX_ENTRY_PRICE || "0.98"),
-    stopLoss: parseFloat(process.env.BACKTEST_STOP_LOSS || "0.80"),
-    profitTarget: parseFloat(process.env.BACKTEST_PROFIT_TARGET || "0.99"),
-    maxSpread: parseFloat(process.env.BACKTEST_MAX_SPREAD || "0.03"),
-    timeWindowMs: parseInt(process.env.BACKTEST_TIME_WINDOW_MINS || "5", 10) * 60 * 1000,
-    startingBalance: parseFloat(process.env.BACKTEST_STARTING_BALANCE || "100"),
-    defaultDays: parseInt(process.env.BACKTEST_DAYS || "7", 10),
-    compoundLimit: parseFloat(process.env.BACKTEST_COMPOUND_LIMIT || "0"),
-    baseBalance: parseFloat(process.env.BACKTEST_BASE_BALANCE || "10"),
+    mode: backtestConfig.mode,
+    entryThreshold: mode.entryThreshold,
+    maxEntryPrice: mode.maxEntryPrice,
+    stopLoss: mode.stopLoss,
+    profitTarget: mode.profitTarget,
+    maxSpread: mode.maxSpread,
+    timeWindowMs: mode.timeWindowMs,
+    startingBalance: backtestConfig.startingBalance,
+    defaultDays: backtestConfig.days,
+    slippage: backtestConfig.slippage,
+    compoundLimit: profitTaking.compoundLimit,
+    baseBalance: profitTaking.baseBalance,
   };
 }
 
 // Calculate date range
 function getDateRange(args: ReturnType<typeof parseArguments>["values"]): { startDate: Date; endDate: Date } {
-  const envConfig = getEnvConfig();
+  const fileConfig = getConfigFromFile();
   const endDate = args.end ? new Date(args.end) : new Date();
-  const days = parseInt(args.days || String(envConfig.defaultDays), 10);
+  const days = parseInt(args.days || String(fileConfig.defaultDays), 10);
   const startDate = args.start
     ? new Date(args.start)
     : new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
@@ -240,8 +250,27 @@ function validateBacktestConfig(config: BacktestConfig): void {
 
 /**
  * Get preset config overrides for a risk mode
+ * First tries to load from config file, falls back to hardcoded presets
  */
 function getPresetForMode(mode: RiskMode): Partial<BacktestConfig> {
+  // Try to load from config file
+  const configManager = getConfigManager();
+  const modeConfig = configManager.getMode(mode);
+
+  if (modeConfig) {
+    const preset: Partial<BacktestConfig> = {
+      entryThreshold: modeConfig.entryThreshold,
+      maxEntryPrice: modeConfig.maxEntryPrice,
+      stopLoss: modeConfig.stopLoss,
+      profitTarget: modeConfig.profitTarget,
+      maxSpread: modeConfig.maxSpread,
+      timeWindowMs: modeConfig.timeWindowMs,
+      riskMode: mode,
+    };
+    return preset;
+  }
+
+  // Fallback to hardcoded presets for backwards compatibility
   switch (mode) {
     case "super-risk":
       return SUPER_RISK_CONFIG;
@@ -255,31 +284,31 @@ function getPresetForMode(mode: RiskMode): Partial<BacktestConfig> {
   }
 }
 
-// Build config from arguments (env config is the base, CLI args override)
+// Build config from arguments (config file is the base, CLI args override)
 function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDate: Date, endDate: Date): BacktestConfig {
-  const envConfig = getEnvConfig();
-  const mode = (args.mode || envConfig.mode) as RiskMode;
+  const fileConfig = getConfigFromFile();
+  const mode = (args.mode || fileConfig.mode) as RiskMode;
 
   // Get preset overrides for the risk mode
   const modePreset = getPresetForMode(mode);
 
-  // Build config: defaults < mode preset < env config < CLI args
+  // Build config: defaults < mode preset < config file < CLI args
   const config: BacktestConfig = {
     // Start with defaults
     ...DEFAULT_BACKTEST_CONFIG,
     // Apply mode preset
     ...modePreset,
-    // Apply env/CLI values
-    entryThreshold: args.entry ? parseFloat(args.entry) : (modePreset.entryThreshold ?? envConfig.entryThreshold),
-    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : (modePreset.maxEntryPrice ?? envConfig.maxEntryPrice),
-    stopLoss: args.stop ? parseFloat(args.stop) : (modePreset.stopLoss ?? envConfig.stopLoss),
-    maxSpread: args.spread ? parseFloat(args.spread) : (modePreset.maxSpread ?? envConfig.maxSpread),
-    timeWindowMs: args.window ? parseInt(args.window, 10) : (modePreset.timeWindowMs ?? envConfig.timeWindowMs),
-    profitTarget: modePreset.profitTarget ?? envConfig.profitTarget,
-    startingBalance: args.balance ? parseFloat(args.balance) : envConfig.startingBalance,
-    slippage: DEFAULT_BACKTEST_CONFIG.slippage,
-    compoundLimit: envConfig.compoundLimit,
-    baseBalance: envConfig.baseBalance,
+    // Apply config file/CLI values
+    entryThreshold: args.entry ? parseFloat(args.entry) : (modePreset.entryThreshold ?? fileConfig.entryThreshold),
+    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : (modePreset.maxEntryPrice ?? fileConfig.maxEntryPrice),
+    stopLoss: args.stop ? parseFloat(args.stop) : (modePreset.stopLoss ?? fileConfig.stopLoss),
+    maxSpread: args.spread ? parseFloat(args.spread) : (modePreset.maxSpread ?? fileConfig.maxSpread),
+    timeWindowMs: args.window ? parseInt(args.window, 10) : (modePreset.timeWindowMs ?? fileConfig.timeWindowMs),
+    profitTarget: modePreset.profitTarget ?? fileConfig.profitTarget,
+    startingBalance: args.balance ? parseFloat(args.balance) : fileConfig.startingBalance,
+    slippage: fileConfig.slippage,
+    compoundLimit: fileConfig.compoundLimit,
+    baseBalance: fileConfig.baseBalance,
     riskMode: mode,
     startDate,
     endDate,

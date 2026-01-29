@@ -2,29 +2,9 @@ import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, fetchMarketResolution, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, type Trade } from "./db";
 import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
+import { type ConfigManager, type ConfigChangeEvent, type BotConfig, type RiskMode, isDynamicMode } from "./config";
 
-// Profit targets by risk mode
-const PROFIT_TARGET_NORMAL = 0.99;      // Conservative: sell at $0.99
-const PROFIT_TARGET_AGGRESSIVE = 0.98;  // Super-risk & Dynamic-risk: sell at $0.98
-
-export type RiskMode = "normal" | "super-risk" | "dynamic-risk" | "safe";
-
-export interface BotConfig {
-  entryThreshold: number;  // e.g., 0.95
-  maxEntryPrice: number;   // e.g., 0.98 - avoid ceiling price
-  stopLoss: number;        // e.g., 0.80
-  maxSpread: number;       // e.g., 0.03 - max bid-ask spread
-  timeWindowMs: number;    // e.g., 5 * 60 * 1000
-  pollIntervalMs: number;  // e.g., 10 * 1000
-  paperTrading: boolean;   // Simulate trades with virtual money
-  paperBalance: number;    // Starting balance for paper trading
-  riskMode: RiskMode;      // "normal" or "super-risk"
-  compoundLimit: number;   // e.g., 15 - take profit when balance exceeds this
-  baseBalance: number;     // e.g., 10 - reset to this after taking profit
-  signatureType: SignatureType; // 0=EOA, 1=Poly Proxy (Magic.link), 2=Gnosis Safe
-  funderAddress?: string;  // Proxy wallet address (required for signature type 1)
-  maxPositions: number;    // e.g., 1 - max concurrent positions (prevents excessive risk)
-}
+export type { RiskMode, BotConfig } from "./config";
 
 export interface Position {
   tradeId: number;
@@ -78,13 +58,10 @@ export type LogCallback = (message: string) => void;
 // Increased from 100 to 500 to reduce risk of missing profit exits
 const MAX_LIMIT_FILLS_CACHE = 500;
 
-// Paper trading fee simulation (Polymarket charges ~1% taker fee)
-// This makes paper trading results more realistic
-const PAPER_FEE_RATE = 0.01;  // 1% fee on each trade
-
 export class Bot {
   private trader: Trader;
   private config: BotConfig;
+  private configManager: ConfigManager;
   private state: BotState;
   private interval: Timer | null = null;
   private onLog: LogCallback;
@@ -92,18 +69,17 @@ export class Bot {
   private userStream: UserStream | null = null;
   private wsLimitFills: Map<string, { filledShares: number; avgPrice: number; timestamp: number }> = new Map();
   private pendingLimitFills: Set<string> = new Set();
-  private wsPriceMaxAgeMs = 5000;
   private lastMarketRefresh: Date | null = null;
-  private marketRefreshInterval = 30000; // Refresh markets every 30 seconds
 
-  constructor(privateKey: string, config: BotConfig, onLog: LogCallback = console.log) {
-    this.trader = new Trader(privateKey, config.signatureType, config.funderAddress);
-    this.config = config;
+  constructor(privateKey: string, configManager: ConfigManager, onLog: LogCallback = console.log) {
+    this.configManager = configManager;
+    this.config = configManager.toBotConfig();
+    this.trader = new Trader(privateKey, this.config.signatureType, this.config.funderAddress);
     this.onLog = onLog;
     this.priceStream = getPriceStream();
     this.state = {
       running: false,
-      balance: config.paperTrading ? config.paperBalance : 0,
+      balance: this.config.paperTrading ? this.config.paperBalance : 0,
       reservedBalance: 0,
       savedProfit: 0,
       positions: new Map(),
@@ -116,11 +92,64 @@ export class Bot {
       wsConnected: false,
       userWsConnected: false,
       markets: [],
-      paperTrading: config.paperTrading,
+      paperTrading: this.config.paperTrading,
       consecutiveLosses: 0,
       consecutiveWins: 0,
       marketResolutions: new Map()
     };
+
+    // Subscribe to config changes for hot-reload
+    this.configManager.onConfigChange((event) => this.handleConfigChange(event));
+  }
+
+  /**
+   * Handle configuration changes (hot-reload)
+   */
+  private handleConfigChange(event: ConfigChangeEvent): void {
+    const prevConfig = this.config;
+    this.config = this.configManager.toBotConfig();
+
+    // Check for changes that require special handling
+    const requiresRestart = event.changedPaths.some(path =>
+      path.startsWith("trading.paperTrading") ||
+      path.startsWith("wallet.signatureType") ||
+      path.startsWith("wallet.funderAddress")
+    );
+
+    if (requiresRestart) {
+      this.log("[CONFIG] Changed setting requires restart to take effect");
+    }
+
+    // Handle paperBalance changes in paper trading mode
+    if (event.changedPaths.includes("trading.paperBalance") && this.config.paperTrading) {
+      if (this.state.positions.size === 0) {
+        this.state.balance = this.config.paperBalance;
+        this.log(`[CONFIG] Paper balance updated to $${this.config.paperBalance.toFixed(2)}`);
+      } else {
+        this.log(`[CONFIG] Paper balance change ignored (${this.state.positions.size} open positions)`);
+      }
+    }
+
+    // Handle pollIntervalMs changes - restart the interval
+    if (event.changedPaths.includes("trading.pollIntervalMs") && this.interval) {
+      clearInterval(this.interval);
+      this.interval = setInterval(() => this.tick(), this.config.pollIntervalMs);
+      this.log(`[CONFIG] Poll interval changed to ${this.config.pollIntervalMs}ms`);
+    }
+
+    // Log mode changes
+    if (event.changedPaths.includes("activeMode")) {
+      this.log(`[CONFIG] Mode changed: ${prevConfig.riskMode} -> ${this.config.riskMode}`);
+    }
+
+    // Log threshold changes for current mode
+    const thresholdChanges = event.changedPaths.filter(p =>
+      p.includes("entryThreshold") || p.includes("stopLoss") || p.includes("maxEntryPrice")
+    );
+    if (thresholdChanges.length > 0) {
+      const mode = this.configManager.getActiveMode();
+      this.log(`[CONFIG] Updated: entry=$${mode.entryThreshold.toFixed(2)}, stop=$${mode.stopLoss.toFixed(2)}`);
+    }
   }
 
   private parseMarketEndDate(trade: Trade): Date {
@@ -154,64 +183,63 @@ export class Bot {
   }
 
   /**
-   * Get profit target based on risk mode
+   * Get profit target from config
    */
   private getProfitTarget(): number {
-    if (this.config.riskMode === "super-risk" || this.config.riskMode === "dynamic-risk" || this.config.riskMode === "safe") {
-      return PROFIT_TARGET_AGGRESSIVE; // $0.98
-    }
-    return PROFIT_TARGET_NORMAL; // $0.99
+    return this.configManager.getProfitTarget();
+  }
+
+  /**
+   * Get paper fee rate from config
+   */
+  private getPaperFeeRate(): number {
+    return this.configManager.getAdvanced().paperFeeRate;
+  }
+
+  /**
+   * Get WebSocket price max age from config
+   */
+  private getWsPriceMaxAgeMs(): number {
+    return this.configManager.getAdvanced().wsPriceMaxAgeMs;
+  }
+
+  /**
+   * Get market refresh interval from config
+   */
+  private getMarketRefreshInterval(): number {
+    return this.configManager.getAdvanced().marketRefreshInterval;
   }
 
   /**
    * Get active trading config based on risk mode
-   * SUPER-RISK mode uses more aggressive parameters
+   * Parameters are loaded from config file, supporting custom modes
    * DYNAMIC-RISK uses dynamic entry threshold and entry-relative stop-loss
    */
   private getActiveConfig() {
-    if (this.config.riskMode === "safe") {
-      return {
-        entryThreshold: 0.95,
-        maxEntryPrice: 0.98,
-        stopLoss: 0.90,
-        timeWindowMs: 5 * 60 * 1000,  // Standard 5 min window
-        maxSpread: 0.03,  // Conservative spread
-        maxDrawdownPercent: 0  // Not used in safe (uses fixed stopLoss)
-      };
-    }
-    if (this.config.riskMode === "super-risk") {
-      return {
-        entryThreshold: 0.70,
-        maxEntryPrice: 0.95,
-        stopLoss: 0.40,
-        timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
-        maxSpread: 0.05,  // Allow wider spreads for volatile entries
-        maxDrawdownPercent: 0  // Not used in super-risk (uses fixed stopLoss)
-      };
-    }
-    if (this.config.riskMode === "dynamic-risk") {
-      // Dynamic entry threshold: tighten after consecutive losses
-      // Base: $0.70, +$0.05 per loss, cap at $0.85
-      const baseThreshold = 0.70;
-      const lossAdjustment = Math.min(this.state.consecutiveLosses * 0.05, 0.15);
-      const dynamicThreshold = baseThreshold + lossAdjustment;
+    const mode = this.configManager.getActiveMode();
+
+    // For dynamic-risk, calculate dynamic entry threshold
+    if (isDynamicMode(mode)) {
+      const dynamicThreshold = this.configManager.getDynamicEntryThreshold(this.state.consecutiveLosses);
 
       return {
         entryThreshold: dynamicThreshold,
-        maxEntryPrice: 0.95,
-        stopLoss: 0.40,  // Fallback only - we use dynamic per-position stop
-        timeWindowMs: 15 * 60 * 1000,  // Full 15 min market duration
-        maxSpread: 0.05,
-        maxDrawdownPercent: 0.325  // 32.5% max loss per trade (dynamic stop-loss)
+        maxEntryPrice: mode.maxEntryPrice,
+        stopLoss: mode.stopLoss, // Fallback only - we use dynamic per-position stop
+        timeWindowMs: mode.timeWindowMs,
+        maxSpread: mode.maxSpread,
+        maxDrawdownPercent: mode.maxDrawdownPercent
       };
     }
+
+    // Standard mode config from file
     return {
-      entryThreshold: this.config.entryThreshold,
-      maxEntryPrice: this.config.maxEntryPrice,
-      stopLoss: this.config.stopLoss,
-      timeWindowMs: this.config.timeWindowMs,
-      maxSpread: this.config.maxSpread,
-      maxDrawdownPercent: 0  // Not used in normal mode
+      entryThreshold: mode.entryThreshold,
+      maxEntryPrice: mode.maxEntryPrice,
+      stopLoss: mode.stopLoss,
+      timeWindowMs: mode.timeWindowMs,
+      maxSpread: mode.maxSpread,
+      maxDrawdownPercent: 0 // Not used in non-dynamic modes
     };
   }
 
@@ -720,7 +748,7 @@ export class Bot {
     const overrides: PriceOverride = {};
     for (const market of this.state.markets) {
       for (const tokenId of market.clobTokenIds) {
-        const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
+        const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
         if (wsPrice) {
           overrides[tokenId] = {
             bestBid: wsPrice.bestBid,
@@ -794,7 +822,7 @@ export class Bot {
       try {
         if (this.config.paperTrading) {
           // Paper trading: check if price hit profit target
-          const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
+          const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
             // Simulate limit order fill at profit target
             const exitPrice = this.getProfitTarget();
@@ -841,7 +869,7 @@ export class Bot {
           }
 
           // No limit order OR not filled yet - check if price hit target and sell manually
-          const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
+          const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
             this.log(`Price hit profit target $${wsPrice.bestBid.toFixed(2)} - selling manually`);
 
@@ -1099,7 +1127,7 @@ export class Bot {
       try {
         // Use WebSocket price if available, otherwise fall back to REST API
         let currentBid: number;
-        const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
+        const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
         if (wsPrice && this.state.wsConnected) {
           currentBid = wsPrice.bestBid;
         } else if (!this.config.paperTrading) {
@@ -1312,11 +1340,12 @@ export class Bot {
           // Calculate shares: balance / askPrice
           const rawShares = availableBalance / askPrice;
           // Apply paper trading fee (simulates Polymarket's ~1% taker fee)
-          const shares = rawShares * (1 - PAPER_FEE_RATE);
+          const paperFeeRate = this.getPaperFeeRate();
+          const shares = rawShares * (1 - paperFeeRate);
 
           // Check minimum order size (Polymarket requires at least 5 shares)
           if (shares < MIN_ORDER_SIZE) {
-            const minUsdc = MIN_ORDER_SIZE * askPrice / (1 - PAPER_FEE_RATE);
+            const minUsdc = MIN_ORDER_SIZE * askPrice / (1 - paperFeeRate);
             this.log(`[PAPER] Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${availableBalance.toFixed(2)})`);
             return;
           }
@@ -1348,7 +1377,7 @@ export class Bot {
           // Deduct from paper balance
           this.state.balance -= availableBalance;
 
-          this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask (fee: ${(PAPER_FEE_RATE * 100).toFixed(1)}%)`);
+          this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask (fee: ${(paperFeeRate * 100).toFixed(1)}%)`);
           this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
         } finally {
           // Release the reserved balance
@@ -1494,17 +1523,17 @@ export class Bot {
       userConnected: this.state.userWsConnected,
       userLastMessageAt: this.userStream ? this.userStream.getLastMessageAt() : 0,
       userMarketCount: this.userStream ? this.userStream.getMarketCount() : 0,
-      priceMaxAgeMs: this.wsPriceMaxAgeMs
+      priceMaxAgeMs: this.getWsPriceMaxAgeMs()
     };
   }
 
   async getMarketOverview(): Promise<EligibleMarket[]> {
     const activeConfig = this.getActiveConfig();
 
-    // Only refresh markets periodically (every 30 seconds), not every UI render
+    // Only refresh markets periodically, not every UI render
     const now = new Date();
     const shouldRefresh = !this.lastMarketRefresh ||
-                         (now.getTime() - this.lastMarketRefresh.getTime()) > this.marketRefreshInterval;
+                         (now.getTime() - this.lastMarketRefresh.getTime()) > this.getMarketRefreshInterval();
 
     if (shouldRefresh) {
       this.state.markets = await fetchBtc15MinMarkets();
@@ -1524,5 +1553,12 @@ export class Bot {
 
   isWsConnected(): boolean {
     return this.state.wsConnected;
+  }
+
+  /**
+   * Get the ConfigManager instance (for UI display)
+   */
+  getConfigManager(): ConfigManager {
+    return this.configManager;
   }
 }
