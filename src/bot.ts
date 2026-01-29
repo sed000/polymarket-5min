@@ -2,7 +2,7 @@ import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, fetchMarketResolution, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
 import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, type Trade } from "./db";
 import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
-import { type ConfigManager, type ConfigChangeEvent, type BotConfig, type RiskMode, isDynamicMode } from "./config";
+import { type ConfigManager, type ConfigChangeEvent, type BotConfig } from "./config";
 
 export type { RiskMode, BotConfig } from "./config";
 
@@ -15,7 +15,6 @@ export interface Position {
   marketSlug: string;
   marketEndDate: Date;
   limitOrderId?: string; // Limit sell order at $0.99
-  dynamicStopLoss?: number; // Dynamic-risk: entry-relative stop-loss (entryPrice * 0.675)
 }
 
 export interface BotState {
@@ -34,9 +33,6 @@ export interface BotState {
   userWsConnected: boolean;
   markets: Market[];
   paperTrading: boolean;
-  // Dynamic-risk: loss streak tracking for dynamic entry threshold
-  consecutiveLosses: number;
-  consecutiveWins: number;
   // Market resolutions from WebSocket (slug -> winning token ID)
   marketResolutions: Map<string, string>;
 }
@@ -93,8 +89,6 @@ export class Bot {
       userWsConnected: false,
       markets: [],
       paperTrading: this.config.paperTrading,
-      consecutiveLosses: 0,
-      consecutiveWins: 0,
       marketResolutions: new Map()
     };
 
@@ -164,24 +158,6 @@ export class Bot {
     return new Date(0);
   }
 
-  private logDynamicStreak(isWin: boolean): void {
-    if (this.config.riskMode !== "dynamic-risk") return;
-    if (isWin) {
-      this.log(`[DYNAMIC] Win streak: ${this.state.consecutiveWins} | Entry threshold reset to $0.70`);
-    } else {
-      const newThreshold = Math.min(0.70 + this.state.consecutiveLosses * 0.05, 0.85);
-      this.log(`[DYNAMIC] Loss streak: ${this.state.consecutiveLosses} | Entry threshold now: $${newThreshold.toFixed(2)}`);
-    }
-  }
-
-  private getModeLabel(): string {
-    const labels: Record<string, string> = {
-      "super-risk": "[SUPER-RISK] ",
-      "dynamic-risk": "[DYNAMIC] "
-    };
-    return labels[this.config.riskMode] || "";
-  }
-
   /**
    * Get profit target from config
    */
@@ -213,33 +189,16 @@ export class Bot {
   /**
    * Get active trading config based on risk mode
    * Parameters are loaded from config file, supporting custom modes
-   * DYNAMIC-RISK uses dynamic entry threshold and entry-relative stop-loss
    */
   private getActiveConfig() {
     const mode = this.configManager.getActiveMode();
 
-    // For dynamic-risk, calculate dynamic entry threshold
-    if (isDynamicMode(mode)) {
-      const dynamicThreshold = this.configManager.getDynamicEntryThreshold(this.state.consecutiveLosses);
-
-      return {
-        entryThreshold: dynamicThreshold,
-        maxEntryPrice: mode.maxEntryPrice,
-        stopLoss: mode.stopLoss, // Fallback only - we use dynamic per-position stop
-        timeWindowMs: mode.timeWindowMs,
-        maxSpread: mode.maxSpread,
-        maxDrawdownPercent: mode.maxDrawdownPercent
-      };
-    }
-
-    // Standard mode config from file
     return {
       entryThreshold: mode.entryThreshold,
       maxEntryPrice: mode.maxEntryPrice,
       stopLoss: mode.stopLoss,
       timeWindowMs: mode.timeWindowMs,
-      maxSpread: mode.maxSpread,
-      maxDrawdownPercent: 0 // Not used in non-dynamic modes
+      maxSpread: mode.maxSpread
     };
   }
 
@@ -582,11 +541,7 @@ export class Bot {
         this.wsLimitFills.delete(current.limitOrderId);
       }
 
-      this.state.consecutiveWins++;
-      this.state.consecutiveLosses = 0;
-
       this.log(`[${source}] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-      this.logDynamicStreak(true);
       const newBalance = await this.trader.getBalance();
       if (newBalance !== null) {
         this.state.balance = newBalance;
@@ -833,13 +788,8 @@ export class Bot {
             this.state.positions.delete(tokenId);
             this.state.balance += proceeds;
 
-            // Track consecutive wins (profit target hit = win)
-            this.state.consecutiveWins++;
-            this.state.consecutiveLosses = 0;
-
             this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
             this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
-            this.logDynamicStreak(true);
             this.checkCompoundLimit();
           }
         } else {
@@ -884,9 +834,6 @@ export class Bot {
               const pnl = (result.price - position.entryPrice) * position.shares;
               closeTrade(position.tradeId, result.price, "RESOLVED");
               this.state.positions.delete(tokenId);
-
-              this.state.consecutiveWins++;
-              this.state.consecutiveLosses = 0;
 
               this.log(`Profit taken @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
               const newBalance = await this.trader.getBalance();
@@ -954,18 +901,8 @@ export class Bot {
           this.state.positions.delete(tokenId);
           this.state.balance += proceeds;
 
-          // Track consecutive wins/losses based on actual PnL
-          if (pnl > 0) {
-            this.state.consecutiveWins++;
-            this.state.consecutiveLosses = 0;
-          } else {
-            this.state.consecutiveLosses++;
-            this.state.consecutiveWins = 0;
-          }
-
           this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
           this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
-          this.logDynamicStreak(pnl > 0);
           this.checkCompoundLimit();
         } else {
           // Real trading: try market sell at actual price, then cancel limit order
@@ -983,17 +920,7 @@ export class Bot {
               this.state.positions.delete(tokenId);
               const realPnl = (result.price - position.entryPrice) * position.shares;
 
-              // Track consecutive wins/losses based on actual PnL
-              if (realPnl > 0) {
-                this.state.consecutiveWins++;
-                this.state.consecutiveLosses = 0;
-              } else {
-                this.state.consecutiveLosses++;
-                this.state.consecutiveWins = 0;
-              }
-
               this.log(`Market resolved @ $${result.price.toFixed(2)}. PnL: $${realPnl.toFixed(2)}`);
-              this.logDynamicStreak(realPnl > 0);
 
               // Sync balance after exit
               const newBalance = await this.trader.getBalance();
@@ -1025,11 +952,8 @@ export class Bot {
 
     const activeConfig = this.getActiveConfig();
 
-    // Use dynamic stop-loss if available (dynamic-risk), otherwise use fixed config
-    const effectiveStopLoss = position.dynamicStopLoss || activeConfig.stopLoss;
-
     // Check if price is below stop-loss threshold - execute immediately
-    if (currentBid <= effectiveStopLoss) {
+    if (currentBid <= activeConfig.stopLoss) {
       await this.executeStopLoss(tokenId, position, currentBid);
     }
   }
@@ -1066,11 +990,6 @@ export class Bot {
         const pnl = (exitPrice - position.entryPrice) * position.shares;
         this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
 
-        // Track consecutive losses (stop-loss = loss)
-        this.state.consecutiveLosses++;
-        this.state.consecutiveWins = 0;
-        this.logDynamicStreak(false);
-
         this.checkCompoundLimit();
       } else {
         // Real trading: market sell FIRST, then cancel limit order
@@ -1095,11 +1014,6 @@ export class Bot {
             this.state.positions.delete(tokenId);
             const pnl = (result.price - position.entryPrice) * position.shares;
             this.log(`Closed position @ $${result.price.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
-
-            // Track consecutive losses (stop-loss = loss)
-            this.state.consecutiveLosses++;
-            this.state.consecutiveWins = 0;
-            this.logDynamicStreak(false);
 
             // Sync balance after exit
             const newBalance = await this.trader.getBalance();
@@ -1137,11 +1051,8 @@ export class Bot {
           continue; // Skip if no price available in paper mode
         }
 
-        // Use dynamic stop-loss if available (dynamic-risk), otherwise use fixed config
-        const effectiveStopLoss = position.dynamicStopLoss || activeConfig.stopLoss;
-
         // Check if price is below stop-loss threshold - execute immediately
-        if (currentBid <= effectiveStopLoss) {
+        if (currentBid <= activeConfig.stopLoss) {
           await this.executeStopLoss(tokenId, position, currentBid);
         }
       } catch (err) {
@@ -1294,22 +1205,10 @@ export class Bot {
         return;
       }
 
-      // Claude-mode: Apply spread-based threshold adjustment
-      // Wide spreads (>50% of max) require $0.03 higher entry for extra safety
-      let effectiveThreshold = activeConfig.entryThreshold;
-      if (this.config.riskMode === "dynamic-risk") {
-        const spreadAdjustment = spread > (activeConfig.maxSpread * 0.5) ? 0.03 : 0;
-        effectiveThreshold = activeConfig.entryThreshold + spreadAdjustment;
-        if (askPrice < effectiveThreshold) {
-          this.log(`Skipping: ask $${askPrice.toFixed(2)} < spread-adjusted threshold $${effectiveThreshold.toFixed(2)}`);
-          return;
-        }
-      }
-
-      // Calculate dynamic stop-loss for dynamic-risk (entry-relative)
-      let dynamicStopLoss: number | undefined;
-      if (this.config.riskMode === "dynamic-risk" && activeConfig.maxDrawdownPercent > 0) {
-        dynamicStopLoss = askPrice * (1 - activeConfig.maxDrawdownPercent);
+      // Don't buy if ask price is below entry threshold
+      if (askPrice < activeConfig.entryThreshold) {
+        this.log(`Skipping: ask $${askPrice.toFixed(2)} < entry threshold $${activeConfig.entryThreshold.toFixed(2)}`);
+        return;
       }
 
       // Only enter OPPOSITE side of last WINNING trade IN THE SAME MARKET for the same side
@@ -1322,8 +1221,7 @@ export class Bot {
         return;
       }
 
-      const stopInfo = dynamicStopLoss ? ` (stop: $${dynamicStopLoss.toFixed(2)})` : "";
-      this.log(`${this.getModeLabel()}Entry signal: ${side} @ $${askPrice.toFixed(2)} ask${stopInfo} (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
+      this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
       if (this.config.paperTrading) {
         // Paper trading: simulate buy at ask price
@@ -1370,8 +1268,7 @@ export class Bot {
             side,
             marketSlug: market.slug,
             marketEndDate: endDate,
-            limitOrderId: "paper-limit-" + tradeId, // Simulated limit order
-            dynamicStopLoss
+            limitOrderId: "paper-limit-" + tradeId // Simulated limit order
           });
 
           // Deduct from paper balance
@@ -1471,12 +1368,6 @@ export class Bot {
             market_end_date: endDate.toISOString()
           });
 
-          // Recalculate dynamic stop-loss with actual entry price
-          let actualDynamicStopLoss: number | undefined;
-          if (this.config.riskMode === "dynamic-risk" && activeConfig.maxDrawdownPercent > 0) {
-            actualDynamicStopLoss = actualEntryPrice * (1 - activeConfig.maxDrawdownPercent);
-          }
-
           this.state.positions.set(tokenId, {
             tradeId,
             tokenId,
@@ -1485,8 +1376,7 @@ export class Bot {
             side,
             marketSlug: market.slug,
             marketEndDate: endDate,
-            limitOrderId,
-            dynamicStopLoss: actualDynamicStopLoss
+            limitOrderId
           });
 
           // Sync balance after trade

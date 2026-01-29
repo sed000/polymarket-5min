@@ -1,22 +1,20 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
 import type { BacktestConfig } from "./types";
-import { DEFAULT_BACKTEST_CONFIG, SUPER_RISK_CONFIG, SAFE_CONFIG, DYNAMIC_RISK_CONFIG } from "./types";
-import { type RiskMode, getConfigManager, isDynamicMode } from "../config";
+import { DEFAULT_BACKTEST_CONFIG } from "./types";
+import { type RiskMode, getConfigManager } from "../config";
 import { fetchHistoricalDataset, loadCachedDataset, getCacheStats } from "./data-fetcher";
-import { runBacktest, BacktestEngine } from "./engine";
+import { runBacktest } from "./engine";
 import {
   runOptimization,
   getQuickOptimizationRanges,
   getDetailedOptimizationRanges,
-  compareConfigs,
 } from "./optimizer";
 import { runGeneticOptimization } from "./genetic";
 import { printGeneticProgress, clearGeneticProgress, printGeneticReport, geneticResultToJSON, exportConfigForEnv } from "./genetic/reporter";
 import {
   printBacktestReport,
   printOptimizationTable,
-  printComparisonTable,
   printTrades,
   printProgress,
   clearProgress,
@@ -46,7 +44,6 @@ COMMANDS:
   fetch     Fetch historical market data from Polymarket API
   optimize  Find optimal parameters through grid search
   genetic   Find optimal parameters using genetic algorithm (recommended)
-  compare   Compare normal vs super-risk mode
   history   View past backtest runs
   stats     Show cached data statistics
   clear     Clear cached data
@@ -61,7 +58,7 @@ OPTIONS:
   --spread <price>    Max spread (default: 0.03)
   --window <ms>       Time window in ms (default: 300000)
   --balance <amount>  Starting balance (default: 100)
-  --mode <mode>       Risk mode: normal, super-risk, dynamic-risk, or safe
+  --mode <mode>       Risk mode: normal
   --quick             Use quick optimization (fewer combinations)
   --force             Force re-fetch data even if cached
   --export <file>     Export results to file (csv or json)
@@ -93,8 +90,6 @@ EXAMPLES:
   # Run genetic with custom settings
   bun run src/backtest/index.ts genetic --days 30 --population 100 --generations 200
 
-  # Compare risk modes
-  bun run src/backtest/index.ts compare --days 7
 `;
 
 // Parse command line arguments
@@ -233,9 +228,8 @@ function validateBacktestConfig(config: BacktestConfig): void {
   }
 
   // Risk mode validation
-  const validModes: RiskMode[] = ["normal", "super-risk", "dynamic-risk", "safe"];
-  if (!validModes.includes(config.riskMode)) {
-    errors.push(`riskMode must be one of: ${validModes.join(", ")} (got ${config.riskMode})`);
+  if (config.riskMode !== "normal") {
+    errors.push(`riskMode must be "normal" (got ${config.riskMode})`);
   }
 
   // Time window validation
@@ -248,63 +242,22 @@ function validateBacktestConfig(config: BacktestConfig): void {
   }
 }
 
-/**
- * Get preset config overrides for a risk mode
- * First tries to load from config file, falls back to hardcoded presets
- */
-function getPresetForMode(mode: RiskMode): Partial<BacktestConfig> {
-  // Try to load from config file
-  const configManager = getConfigManager();
-  const modeConfig = configManager.getMode(mode);
-
-  if (modeConfig) {
-    const preset: Partial<BacktestConfig> = {
-      entryThreshold: modeConfig.entryThreshold,
-      maxEntryPrice: modeConfig.maxEntryPrice,
-      stopLoss: modeConfig.stopLoss,
-      profitTarget: modeConfig.profitTarget,
-      maxSpread: modeConfig.maxSpread,
-      timeWindowMs: modeConfig.timeWindowMs,
-      riskMode: mode,
-    };
-    return preset;
-  }
-
-  // Fallback to hardcoded presets for backwards compatibility
-  switch (mode) {
-    case "super-risk":
-      return SUPER_RISK_CONFIG;
-    case "dynamic-risk":
-      return DYNAMIC_RISK_CONFIG;
-    case "safe":
-      return SAFE_CONFIG;
-    case "normal":
-    default:
-      return {};
-  }
-}
-
 // Build config from arguments (config file is the base, CLI args override)
 function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDate: Date, endDate: Date): BacktestConfig {
   const fileConfig = getConfigFromFile();
   const mode = (args.mode || fileConfig.mode) as RiskMode;
 
-  // Get preset overrides for the risk mode
-  const modePreset = getPresetForMode(mode);
-
   // Build config: defaults < mode preset < config file < CLI args
   const config: BacktestConfig = {
     // Start with defaults
     ...DEFAULT_BACKTEST_CONFIG,
-    // Apply mode preset
-    ...modePreset,
     // Apply config file/CLI values
-    entryThreshold: args.entry ? parseFloat(args.entry) : (modePreset.entryThreshold ?? fileConfig.entryThreshold),
-    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : (modePreset.maxEntryPrice ?? fileConfig.maxEntryPrice),
-    stopLoss: args.stop ? parseFloat(args.stop) : (modePreset.stopLoss ?? fileConfig.stopLoss),
-    maxSpread: args.spread ? parseFloat(args.spread) : (modePreset.maxSpread ?? fileConfig.maxSpread),
-    timeWindowMs: args.window ? parseInt(args.window, 10) : (modePreset.timeWindowMs ?? fileConfig.timeWindowMs),
-    profitTarget: modePreset.profitTarget ?? fileConfig.profitTarget,
+    entryThreshold: args.entry ? parseFloat(args.entry) : fileConfig.entryThreshold,
+    maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : fileConfig.maxEntryPrice,
+    stopLoss: args.stop ? parseFloat(args.stop) : fileConfig.stopLoss,
+    maxSpread: args.spread ? parseFloat(args.spread) : fileConfig.maxSpread,
+    timeWindowMs: args.window ? parseInt(args.window, 10) : fileConfig.timeWindowMs,
+    profitTarget: fileConfig.profitTarget,
     startingBalance: args.balance ? parseFloat(args.balance) : fileConfig.startingBalance,
     slippage: fileConfig.slippage,
     compoundLimit: fileConfig.compoundLimit,
@@ -465,77 +418,6 @@ async function commandGenetic(args: ReturnType<typeof parseArguments>["values"])
   }
 }
 
-// Command: compare
-async function commandCompare(args: ReturnType<typeof parseArguments>["values"]) {
-  const { startDate, endDate } = getDateRange(args);
-
-  const markets = await loadOrFetchMarkets(startDate, endDate);
-  if (!markets) return;
-
-  console.log(`\nComparing configurations on ${markets.length} markets...`);
-
-  // Build configs for all modes
-  const normalConfig: BacktestConfig = {
-    ...DEFAULT_BACKTEST_CONFIG,
-    startDate,
-    endDate,
-    riskMode: "normal",
-  };
-
-  const superRiskConfig: BacktestConfig = {
-    ...DEFAULT_BACKTEST_CONFIG,
-    ...SUPER_RISK_CONFIG,
-    startDate,
-    endDate,
-    riskMode: "super-risk",
-  };
-
-  const dynamicRiskConfig: BacktestConfig = {
-    ...DEFAULT_BACKTEST_CONFIG,
-    ...DYNAMIC_RISK_CONFIG,
-    startDate,
-    endDate,
-    riskMode: "dynamic-risk",
-  };
-
-  const safeConfig: BacktestConfig = {
-    ...DEFAULT_BACKTEST_CONFIG,
-    ...SAFE_CONFIG,
-    startDate,
-    endDate,
-    riskMode: "safe",
-  };
-
-  // Run all backtests
-  console.log("\nRunning backtests for all modes...");
-  const results = [
-    { label: "Normal Mode", result: runBacktest(normalConfig, markets) },
-    { label: "Super-Risk Mode", result: runBacktest(superRiskConfig, markets) },
-    { label: "Dynamic-Risk Mode", result: runBacktest(dynamicRiskConfig, markets) },
-    { label: "Safe Mode", result: runBacktest(safeConfig, markets) },
-  ];
-
-  // Print comparison table
-  console.log("\n=== MODE COMPARISON ===\n");
-  console.log("Mode             | Trades | Win Rate | Total PnL | Max DD   | Sharpe");
-  console.log("-----------------+--------+----------+-----------+----------+--------");
-
-  for (const { label, result } of results) {
-    const m = result.metrics;
-    console.log(
-      `${label.padEnd(16)} | ${m.totalTrades.toString().padStart(6)} | ${(m.winRate * 100).toFixed(1).padStart(7)}% | $${m.totalPnL.toFixed(2).padStart(8)} | ${(m.maxDrawdownPercent * 100).toFixed(1).padStart(7)}% | ${m.sharpeRatio.toFixed(2).padStart(6)}`
-    );
-  }
-
-  console.log("");
-
-  // Print individual results if verbose
-  for (const { label, result } of results) {
-    console.log(`\n--- ${label} ---`);
-    printBacktestReport(result);
-  }
-}
-
 // Command: history
 async function commandHistory(args: ReturnType<typeof parseArguments>["values"]) {
   initBacktestDatabase();
@@ -620,9 +502,6 @@ async function main() {
         break;
       case "genetic":
         await commandGenetic(args);
-        break;
-      case "compare":
-        await commandCompare(args);
         break;
       case "history":
         await commandHistory(args);

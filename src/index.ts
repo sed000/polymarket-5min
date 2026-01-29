@@ -77,7 +77,7 @@ async function main() {
   console.log(`Mode: ${config.riskMode}`);
 
   // Initialize database based on mode
-  initDatabase(config.paperTrading, config.riskMode);
+  initDatabase(config.paperTrading);
 
   // In paper trading mode, use a placeholder key (no real transactions)
   // For real trading, PRIVATE_KEY is validated at startup

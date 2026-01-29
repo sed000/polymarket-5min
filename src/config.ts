@@ -12,14 +12,6 @@ export interface ModeConfig {
   profitTarget: number;
 }
 
-// Dynamic-risk mode has additional parameters
-export interface DynamicModeConfig extends ModeConfig {
-  baseThreshold: number;
-  thresholdIncrement: number;
-  maxThreshold: number;
-  maxDrawdownPercent: number;
-}
-
 // Full trading config file structure
 export interface TradingConfigFile {
   trading: {
@@ -38,7 +30,7 @@ export interface TradingConfigFile {
   };
   activeMode: string;
   modes: {
-    [key: string]: ModeConfig | DynamicModeConfig;
+    [key: string]: ModeConfig;
   };
   backtest: {
     mode: string;
@@ -79,34 +71,6 @@ const DEFAULT_CONFIG: TradingConfigFile = {
       timeWindowMs: 300000,
       profitTarget: 0.99,
     },
-    safe: {
-      entryThreshold: 0.95,
-      maxEntryPrice: 0.97,
-      stopLoss: 0.90,
-      maxSpread: 0.03,
-      timeWindowMs: 300000,
-      profitTarget: 0.98,
-    },
-    "super-risk": {
-      entryThreshold: 0.70,
-      maxEntryPrice: 0.95,
-      stopLoss: 0.40,
-      maxSpread: 0.05,
-      timeWindowMs: 900000,
-      profitTarget: 0.98,
-    },
-    "dynamic-risk": {
-      entryThreshold: 0.70, // Base threshold (for display/initial)
-      baseThreshold: 0.70,
-      thresholdIncrement: 0.05,
-      maxThreshold: 0.85,
-      maxEntryPrice: 0.95,
-      stopLoss: 0.40, // Fallback only
-      maxDrawdownPercent: 0.325,
-      maxSpread: 0.05,
-      timeWindowMs: 900000,
-      profitTarget: 0.98,
-    },
   },
   backtest: {
     mode: "normal",
@@ -130,13 +94,8 @@ export interface ValidationError {
   message: string;
 }
 
-// Check if a mode config is dynamic-risk type
-export function isDynamicMode(mode: ModeConfig | DynamicModeConfig): mode is DynamicModeConfig {
-  return "baseThreshold" in mode && "maxDrawdownPercent" in mode;
-}
-
 // Validate a mode configuration
-function validateModeConfig(modeName: string, mode: ModeConfig | DynamicModeConfig): ValidationError[] {
+function validateModeConfig(modeName: string, mode: ModeConfig): ValidationError[] {
   const errors: ValidationError[] = [];
   const prefix = `modes.${modeName}`;
 
@@ -168,25 +127,6 @@ function validateModeConfig(modeName: string, mode: ModeConfig | DynamicModeConf
   }
   if (mode.maxEntryPrice >= mode.profitTarget) {
     errors.push({ path: `${prefix}.maxEntryPrice`, message: "must be less than profitTarget" });
-  }
-
-  // Dynamic-risk specific validations
-  if (isDynamicMode(mode)) {
-    if (!validateRange(mode.baseThreshold, 0.01, 0.99)) {
-      errors.push({ path: `${prefix}.baseThreshold`, message: "must be between 0.01 and 0.99" });
-    }
-    if (!validateRange(mode.thresholdIncrement, 0.01, 0.2)) {
-      errors.push({ path: `${prefix}.thresholdIncrement`, message: "must be between 0.01 and 0.2" });
-    }
-    if (!validateRange(mode.maxThreshold, 0.01, 0.99)) {
-      errors.push({ path: `${prefix}.maxThreshold`, message: "must be between 0.01 and 0.99" });
-    }
-    if (!validateRange(mode.maxDrawdownPercent, 0.01, 0.99)) {
-      errors.push({ path: `${prefix}.maxDrawdownPercent`, message: "must be between 0.01 and 0.99" });
-    }
-    if (mode.baseThreshold >= mode.maxThreshold) {
-      errors.push({ path: `${prefix}.baseThreshold`, message: "must be less than maxThreshold" });
-    }
   }
 
   return errors;
@@ -224,9 +164,18 @@ function validateConfig(config: TradingConfigFile): ValidationError[] {
     errors.push({ path: "profitTaking.baseBalance", message: "must be positive" });
   }
 
-  // Active mode must exist
+  // Active mode must exist and be normal
   if (!config.modes[config.activeMode]) {
     errors.push({ path: "activeMode", message: `mode "${config.activeMode}" not found in modes` });
+  }
+  if (config.activeMode !== "normal") {
+    errors.push({ path: "activeMode", message: `only "normal" mode is supported (got "${config.activeMode}")` });
+  }
+
+  const modeNames = Object.keys(config.modes);
+  const nonNormalModes = modeNames.filter((mode) => mode !== "normal");
+  if (nonNormalModes.length > 0) {
+    errors.push({ path: "modes", message: `unsupported modes: ${nonNormalModes.join(", ")}` });
   }
 
   // Validate all modes
@@ -237,6 +186,9 @@ function validateConfig(config: TradingConfigFile): ValidationError[] {
   // Backtest section
   if (!config.modes[config.backtest.mode]) {
     errors.push({ path: "backtest.mode", message: `mode "${config.backtest.mode}" not found in modes` });
+  }
+  if (config.backtest.mode !== "normal") {
+    errors.push({ path: "backtest.mode", message: `only "normal" mode is supported (got "${config.backtest.mode}")` });
   }
   if (config.backtest.startingBalance <= 0) {
     errors.push({ path: "backtest.startingBalance", message: "must be positive" });
@@ -290,7 +242,7 @@ export type ConfigChangeEvent = {
   changedPaths: string[];
 };
 
-export type RiskMode = "normal" | "super-risk" | "dynamic-risk" | "safe" | string;
+export type RiskMode = "normal";
 
 // Legacy BotConfig interface for compatibility
 export interface BotConfig {
@@ -469,38 +421,15 @@ export class ConfigManager extends EventEmitter {
   /**
    * Get the active mode's configuration
    */
-  getActiveMode(): ModeConfig | DynamicModeConfig {
+  getActiveMode(): ModeConfig {
     return this.config.modes[this.config.activeMode];
   }
 
   /**
    * Get a specific mode's configuration
    */
-  getMode(modeName: string): ModeConfig | DynamicModeConfig | undefined {
+  getMode(modeName: string): ModeConfig | undefined {
     return this.config.modes[modeName];
-  }
-
-  /**
-   * Check if the active mode is dynamic-risk
-   */
-  isDynamicRiskMode(): boolean {
-    return isDynamicMode(this.getActiveMode());
-  }
-
-  /**
-   * Get dynamic entry threshold based on consecutive losses
-   */
-  getDynamicEntryThreshold(consecutiveLosses: number): number {
-    const mode = this.getActiveMode();
-    if (!isDynamicMode(mode)) {
-      return mode.entryThreshold;
-    }
-
-    const lossAdjustment = Math.min(
-      consecutiveLosses * mode.thresholdIncrement,
-      mode.maxThreshold - mode.baseThreshold
-    );
-    return mode.baseThreshold + lossAdjustment;
   }
 
   /**

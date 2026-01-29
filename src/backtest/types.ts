@@ -63,7 +63,6 @@ export interface SimulatedPosition {
   shares: number;
   entryPrice: number;
   entryTimestamp: number;
-  dynamicStopLoss?: number; // Entry-relative stop-loss for dynamic-risk mode
 }
 
 // Exit reasons
@@ -195,53 +194,3 @@ export const DEFAULT_BACKTEST_CONFIG: Omit<BacktestConfig, "startDate" | "endDat
   baseBalance: 10,
   riskMode: "normal",
 };
-
-// Super-risk preset
-export const SUPER_RISK_CONFIG: Partial<BacktestConfig> = {
-  entryThreshold: 0.70,
-  maxEntryPrice: 0.95,
-  stopLoss: 0.40,
-  maxSpread: 0.05,
-  timeWindowMs: 15 * 60 * 1000,
-  riskMode: "super-risk",
-};
-
-// Safe preset - conservative with tight stop-loss
-export const SAFE_CONFIG: Partial<BacktestConfig> = {
-  entryThreshold: 0.95,
-  maxEntryPrice: 0.98,
-  stopLoss: 0.90,
-  profitTarget: 0.98,
-  maxSpread: 0.03,
-  timeWindowMs: 5 * 60 * 1000,
-  riskMode: "safe",
-};
-
-/**
- * Dynamic-risk preset - adaptive entry threshold and entry-relative stop-loss
- *
- * This mode mirrors the bot's dynamic-risk behavior:
- * - Base entry threshold: $0.70
- * - Entry threshold increases by $0.05 per consecutive loss (capped at $0.85)
- * - Stop-loss is 32.5% below entry price (entry-relative, not fixed)
- * - Wider spreads trigger +$0.03 threshold adjustment
- *
- * The static config values here are starting points; the backtest engine
- * will dynamically adjust threshold and calculate per-position stop-loss.
- */
-export const DYNAMIC_RISK_CONFIG: Partial<BacktestConfig> = {
-  entryThreshold: 0.70, // Base threshold - adjusted dynamically per loss streak
-  maxEntryPrice: 0.95,
-  stopLoss: 0.40, // Fallback only - engine uses entry-relative stop-loss
-  profitTarget: 0.98,
-  maxSpread: 0.05,
-  timeWindowMs: 15 * 60 * 1000,
-  riskMode: "dynamic-risk",
-};
-
-// Dynamic-risk constants (defaults - can be overridden in trading.config.json)
-export const DYNAMIC_RISK_BASE_THRESHOLD = 0.70;
-export const DYNAMIC_RISK_THRESHOLD_INCREMENT = 0.05;
-export const DYNAMIC_RISK_MAX_THRESHOLD = 0.85;
-export const DYNAMIC_RISK_MAX_DRAWDOWN_PERCENT = 0.325; // 32.5%
-export const DYNAMIC_RISK_SPREAD_ADJUSTMENT = 0.03;

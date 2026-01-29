@@ -1,28 +1,22 @@
 import React, { useState, useEffect } from "react";
 import { render, Box, Text, useInput, useApp } from "ink";
-import { Bot, type BotConfig, type BotState, type WsStats } from "./bot";
+import { Bot, type BotState, type WsStats } from "./bot";
 import { getRecentTrades, getTotalPnL, getTradeStats, type Trade } from "./db";
 import { formatTimeRemaining, type EligibleMarket } from "./scanner";
-import { type ConfigManager, isDynamicMode } from "./config";
+import { type ConfigManager } from "./config";
 
 interface AppProps {
   bot: Bot;
 }
 
-function Header({ state, config, configManager }: { state: BotState; config: BotConfig; configManager: ConfigManager }) {
-  const modeName = configManager.getActiveModeName();
+function Header({ state, configManager }: { state: BotState; configManager: ConfigManager }) {
   const mode = configManager.getActiveMode();
-  const isDynamic = isDynamicMode(mode);
-  const isSuperRisk = modeName === "super-risk";
-  const isSafe = modeName === "safe";
-  const borderColor = isDynamic ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : state.paperTrading ? "yellow" : "cyan";
+  const borderColor = state.paperTrading ? "yellow" : "cyan";
 
   // Get active config values from ConfigManager
-  const activeEntry = isDynamic
-    ? configManager.getDynamicEntryThreshold(state.consecutiveLosses)
-    : mode.entryThreshold;
+  const activeEntry = mode.entryThreshold;
   const activeMaxEntry = mode.maxEntryPrice;
-  const activeStop = isDynamic ? "dynamic" : mode.stopLoss;
+  const activeStop = mode.stopLoss;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
@@ -31,18 +25,6 @@ function Header({ state, config, configManager }: { state: BotState; config: Bot
           POLYMARKET BTC 15-MIN BOT {state.paperTrading && "[PAPER]"}
         </Text>
         <Box gap={2}>
-          {isSafe && (
-            <Text color="green" bold>SAFE</Text>
-          )}
-          {isSuperRisk && (
-            <Text color="magenta" bold>SUPER-RISK</Text>
-          )}
-          {isDynamic && (
-            <Text color="blue" bold>DYNAMIC</Text>
-          )}
-          {!isSafe && !isSuperRisk && !isDynamic && modeName !== "normal" && (
-            <Text color="cyan" bold>{modeName.toUpperCase()}</Text>
-          )}
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
           </Text>
@@ -72,16 +54,9 @@ function Header({ state, config, configManager }: { state: BotState; config: Bot
         {state.savedProfit > 0 && (
           <Text>Saved: <Text color="cyan">${state.savedProfit.toFixed(2)}</Text></Text>
         )}
-        <Text>Entry: <Text color={isDynamic ? "blue" : isSuperRisk ? "magenta" : isSafe ? "green" : "yellow"}>${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
-        <Text>Stop: <Text color="red">{isDynamic ? `${((isDynamicMode(mode) ? mode.maxDrawdownPercent : 0) * 100).toFixed(1)}%` : `≤$${(activeStop as number).toFixed(2)}`}</Text></Text>
+        <Text>Entry: <Text color="yellow">${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
+        <Text>Stop: <Text color="red">≤${activeStop.toFixed(2)}</Text></Text>
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
-        {isDynamic && (
-          <Text>
-            Streak: <Text color={state.consecutiveLosses > 0 ? "red" : "green"}>
-              {state.consecutiveLosses > 0 ? `L${state.consecutiveLosses}` : `W${state.consecutiveWins}`}
-            </Text>
-          </Text>
-        )}
       </Box>
     </Box>
   );
@@ -157,8 +132,7 @@ function PositionsTable({ state, configManager }: { state: BotState; configManag
           <Text color="gray">No open positions</Text>
         ) : (
           positions.map((p, i) => {
-            // Use dynamic stop-loss if available (dynamic-risk), else use default
-            const stopLoss = p.dynamicStopLoss || defaultStopLoss;
+            const stopLoss = defaultStopLoss;
             const potentialWin = (profitTarget - p.entryPrice) * p.shares;
             const potentialLoss = (p.entryPrice - stopLoss) * p.shares;
             return (
@@ -407,7 +381,7 @@ function App({ bot }: AppProps) {
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Header state={state} config={bot.getConfig()} configManager={configManager} />
+      <Header state={state} configManager={configManager} />
       <Box>
         <Box flexDirection="column" width="50%">
           <MarketsTable markets={markets} />

@@ -1,7 +1,7 @@
 {
   "trading": {
     "paperTrading": true,
-    "paperBalance": 400,
+    "paperBalance": 14,
     "maxPositions": 1,
     "pollIntervalMs": 10000
   },
@@ -13,7 +13,7 @@
     "compoundLimit": 50,
     "baseBalance": 30
   },
-  "activeMode": "super-risk",
+  "activeMode": "normal",
   "modes": {
     "normal": {
       "entryThreshold": 0.95,
@@ -22,38 +22,10 @@
       "maxSpread": 0.03,
       "timeWindowMs": 300000,
       "profitTarget": 0.99
-    },
-    "safe": {
-      "entryThreshold": 0.95,
-      "maxEntryPrice": 0.97,
-      "stopLoss": 0.90,
-      "maxSpread": 0.03,
-      "timeWindowMs": 300000,
-      "profitTarget": 0.98
-    },
-    "super-risk": {
-      "entryThreshold": 0.70,
-      "maxEntryPrice": 0.95,
-      "stopLoss": 0.40,
-      "maxSpread": 0.05,
-      "timeWindowMs": 900000,
-      "profitTarget": 0.98
-    },
-    "dynamic-risk": {
-      "entryThreshold": 0.70,
-      "baseThreshold": 0.70,
-      "thresholdIncrement": 0.05,
-      "maxThreshold": 0.85,
-      "maxEntryPrice": 0.95,
-      "stopLoss": 0.40,
-      "maxDrawdownPercent": 0.325,
-      "maxSpread": 0.05,
-      "timeWindowMs": 900000,
-      "profitTarget": 0.98
     }
   },
   "backtest": {
-    "mode": "super-risk",
+    "mode": "normal",
     "startingBalance": 10,
     "days": 7,
     "slippage": 0.001

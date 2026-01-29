@@ -18,12 +18,8 @@ bun start            # Run production
 ### Database Queries
 ```bash
 bun run db:paper     # View paper trading results (normal mode)
-bun run db:risk      # View risk mode results (super-risk)
-bun run db:dynamic   # View dynamic-risk mode results
 bun run db:real      # View real trading results
 bun run db:stats:paper  # Paper trading statistics
-bun run db:stats:risk   # Risk mode statistics
-bun run db:stats:dynamic # Dynamic-risk mode statistics
 bun run db:stats:real   # Real trading statistics
 bun run db:reset:*      # Reset specific database
 ```
@@ -33,7 +29,6 @@ bun run db:reset:*      # Reset specific database
 bun run backtest:run      # Run backtest with current config
 bun run backtest:fetch    # Fetch historical data
 bun run backtest:optimize # Parameter optimization
-bun run backtest:compare  # Compare backtest runs
 bun run backtest:stats    # View backtest statistics
 bun run backtest:history  # View historical runs
 ```
@@ -48,13 +43,11 @@ bun run backtest:history  # View historical runs
 
 **src/bot.ts** - Main trading logic (`Bot` class):
 - Position management with mutex-protected entry/exit to prevent race conditions
-- Three risk modes: "normal" (conservative), "super-risk" (aggressive), and "dynamic-risk" (adaptive)
 - Real-time price monitoring via WebSocket with fallback to REST API
 - Immediate stop-loss execution when price drops below threshold
 - Profit target limit orders at $0.99
 - Compound limit system (take profit when balance exceeds threshold)
 - Paper trading simulation with virtual balance
-- Consecutive loss/win tracking for dynamic-risk mode
 
 **src/trader.ts** - Polymarket CLOB API wrapper. Handles order execution, wallet interaction, signature types (EOA, Magic.link proxy, Gnosis Safe).
 
@@ -63,7 +56,7 @@ bun run backtest:history  # View historical runs
 **src/websocket.ts** - WebSocket connection for real-time orderbook prices. Maintains subscription state, handles reconnection.
 
 **src/db.ts** - SQLite database layer using `bun:sqlite`. Two database systems:
-- Trading DB: `trades_real.db`, `trades_paper_normal.db`, `trades_paper_risk.db`, `trades_paper_dynamic.db`
+- Trading DB: `trades_real.db`, `trades_paper_normal.db`
 - Backtest DB: `backtest.db` with price history, historical markets, and run results
 - Backtest tables: `backtest_runs`, `backtest_trades`, `historical_markets`, `price_history`
 
@@ -101,11 +94,7 @@ Configuration is stored in `trading.config.json` with hot-reload support. Edit t
   },
   "activeMode": "normal",       // Current trading mode
   "modes": {
-    "normal": { ... },          // Built-in mode presets
-    "safe": { ... },
-    "super-risk": { ... },
-    "dynamic-risk": { ... },
-    "my-custom": { ... }        // Custom modes allowed
+    "normal": { ... }           // Mode parameters
   },
   "backtest": {
     "mode": "normal",           // Mode to use for backtesting
@@ -122,17 +111,13 @@ Configuration is stored in `trading.config.json` with hot-reload support. Edit t
 ```
 
 ### Mode Configuration
-Each mode defines trading parameters:
+Normal mode defines trading parameters:
 - `entryThreshold` - Minimum price to enter (e.g., 0.95)
 - `maxEntryPrice` - Maximum price to enter (e.g., 0.98)
 - `stopLoss` - Exit trigger price (e.g., 0.80)
 - `profitTarget` - Limit order price for profit taking
 - `maxSpread` - Max bid-ask spread to accept
 - `timeWindowMs` - Time remaining before market close to enter
-
-Dynamic-risk mode has additional parameters:
-- `baseThreshold`, `thresholdIncrement`, `maxThreshold` - Adaptive entry
-- `maxDrawdownPercent` - Position-relative stop-loss (e.g., 0.325 = 32.5%)
 
 ### Environment Variables
 Only secrets remain in `.env`:
@@ -141,7 +126,6 @@ Only secrets remain in `.env`:
 
 ### Hot-Reload Behavior
 **Safe to change live:**
-- `activeMode` - Switch between modes instantly
 - Mode parameters (thresholds, stops, spreads)
 - `compoundLimit`, `baseBalance`
 - `maxPositions` (affects new entries only)
@@ -157,9 +141,3 @@ Only secrets remain in `.env`:
 - **Opposite-side rule**: After a winning trade, only enter the opposite side in the same market (prevents chasing)
 - **Market slug format**: `btc-updown-15m-{unix_timestamp}` where timestamp is interval start
 - **Price data flow**: WebSocket preferred → REST API fallback → Gamma API for market discovery
-
-### Dynamic-Risk Mode Strategy
-- **Adaptive entry threshold**: Base $0.70, increases +$0.05 per consecutive loss (capped at $0.85)
-- **Position-relative stop-loss**: 32.5% max drawdown per trade (calculated from entry price)
-- **Loss streak tracking**: `consecutiveLosses` / `consecutiveWins` in BotState
-- **Recovery behavior**: Win streak resets threshold to base, preventing "revenge trading"

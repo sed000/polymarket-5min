@@ -6,7 +6,7 @@ Automated trading bot for Polymarket prediction markets with backtesting capabil
 
 - Automated market scanning and trade execution
 - Backtesting engine with historical data analysis
-- Paper trading and risk simulation modes
+- Paper trading mode
 - Real-time trade tracking with SQLite database
 - WebSocket integration for live market data
 
@@ -25,9 +25,9 @@ bun dev
 
 ### Database
 - `bun run db:paper` - View paper trading results
-- `bun run db:risk` - View risk mode results
 - `bun run db:real` - View real trading results
-- `bun run db:stats:*` - View statistics for each mode
+- `bun run db:stats:paper` - View paper trading statistics
+- `bun run db:stats:real` - View real trading statistics
 
 ### Backtesting
 - `bun run backtest:run` - Run backtest
