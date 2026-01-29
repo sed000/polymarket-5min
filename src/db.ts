@@ -4,23 +4,12 @@ let db: Database | null = null;
 let currentDbPath: string | null = null;
 
 /**
- * Initialize the database based on trading mode
+ * Initialize the database for trading mode
  * - Real trading: trades_real.db
- * - Paper + normal: trades_paper_normal.db
- * - Paper + super-risk: trades_paper_risk.db
- * - Paper + dynamic-risk: trades_paper_dynamic.db
- * - Paper + safe: trades_paper_safe.db
+ * - Paper trading: trades_paper_normal.db
  */
-const DB_PATHS: Record<string, string> = {
-  "real": "trades_real.db",
-  "super-risk": "trades_paper_risk.db",
-  "dynamic-risk": "trades_paper_dynamic.db",
-  "safe": "trades_paper_safe.db",
-  "normal": "trades_paper_normal.db"
-};
-
-export function initDatabase(paperTrading: boolean, riskMode: "normal" | "super-risk" | "dynamic-risk" | "safe"): void {
-  const dbPath = paperTrading ? (DB_PATHS[riskMode] || DB_PATHS.normal) : DB_PATHS.real;
+export function initDatabase(paperTrading: boolean): void {
+  const dbPath = paperTrading ? "trades_paper_normal.db" : "trades_real.db";
 
   // Skip if already using this database
   if (currentDbPath === dbPath && db) {

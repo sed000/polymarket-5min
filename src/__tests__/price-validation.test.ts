@@ -207,74 +207,14 @@ describe("Entry Signal Validation", () => {
     });
   });
 
-  describe("super-risk mode entry conditions", () => {
-    const superRiskConfig = {
-      entryThreshold: 0.70,
-      maxEntryPrice: 0.95,
-      maxSpread: 0.05,
-      profitTarget: 0.98,
-    };
-
-    test("accepts lower threshold entries", () => {
-      const result = shouldEnter({
-        ...superRiskConfig,
-        askPrice: 0.72,
-        bidPrice: 0.70,
-      });
-      expect(result.valid).toBe(true);
-    });
-
-    test("accepts wider spreads", () => {
-      const result = shouldEnter({
-        ...superRiskConfig,
-        askPrice: 0.80,
-        bidPrice: 0.76, // spread = 0.04
-      });
-      expect(result.valid).toBe(true);
-    });
-
-    test("rejects entry below aggressive threshold", () => {
-      const result = shouldEnter({
-        ...superRiskConfig,
-        askPrice: 0.65,
-        bidPrice: 0.63,
-      });
-      expect(result.valid).toBe(false);
-    });
-  });
-
-  describe("dynamic-risk mode entry conditions", () => {
-    function getDynamicThreshold(consecutiveLosses: number): number {
-      const base = 0.70;
-      const adjustment = Math.min(consecutiveLosses * 0.05, 0.15);
-      return base + adjustment;
-    }
-
-    test("starts at $0.70 threshold with no losses", () => {
-      expect(getDynamicThreshold(0)).toBe(0.70);
-    });
-
-    test("increases threshold by $0.05 per loss", () => {
-      expect(getDynamicThreshold(1)).toBeCloseTo(0.75, 2);
-      expect(getDynamicThreshold(2)).toBeCloseTo(0.80, 2);
-    });
-
-    test("caps threshold at $0.85", () => {
-      expect(getDynamicThreshold(3)).toBe(0.85);
-      expect(getDynamicThreshold(4)).toBe(0.85);
-      expect(getDynamicThreshold(10)).toBe(0.85);
-    });
-  });
 });
 
 describe("Stop-Loss Validation", () => {
   function shouldTriggerStopLoss(
     currentBid: number,
-    stopLoss: number,
-    dynamicStopLoss?: number
+    stopLoss: number
   ): boolean {
-    const effectiveStopLoss = dynamicStopLoss ?? stopLoss;
-    return currentBid <= effectiveStopLoss;
+    return currentBid <= stopLoss;
   }
 
   describe("fixed stop-loss", () => {
@@ -291,21 +231,4 @@ describe("Stop-Loss Validation", () => {
     });
   });
 
-  describe("dynamic stop-loss (entry-relative)", () => {
-    test("uses dynamic stop-loss when provided", () => {
-      const dynamicStop = 0.95 * (1 - 0.325); // ~0.64
-      expect(shouldTriggerStopLoss(0.63, 0.40, dynamicStop)).toBe(true);
-      expect(shouldTriggerStopLoss(0.65, 0.40, dynamicStop)).toBe(false);
-    });
-
-    test("calculates 32.5% drawdown correctly", () => {
-      const entryPrice = 0.80;
-      const maxDrawdown = 0.325;
-      const dynamicStop = entryPrice * (1 - maxDrawdown);
-
-      expect(dynamicStop).toBeCloseTo(0.54, 2);
-      expect(shouldTriggerStopLoss(0.53, 0.40, dynamicStop)).toBe(true);
-      expect(shouldTriggerStopLoss(0.55, 0.40, dynamicStop)).toBe(false);
-    });
-  });
 });

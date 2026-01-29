@@ -1,0 +1,38 @@
+{
+  "trading": {
+    "paperTrading": true,
+    "paperBalance": 14,
+    "maxPositions": 1,
+    "pollIntervalMs": 10000
+  },
+  "wallet": {
+    "signatureType": 0,
+    "funderAddress": null
+  },
+  "profitTaking": {
+    "compoundLimit": 50,
+    "baseBalance": 30
+  },
+  "activeMode": "normal",
+  "modes": {
+    "normal": {
+      "entryThreshold": 0.95,
+      "maxEntryPrice": 0.98,
+      "stopLoss": 0.80,
+      "maxSpread": 0.03,
+      "timeWindowMs": 300000,
+      "profitTarget": 0.99
+    }
+  },
+  "backtest": {
+    "mode": "normal",
+    "startingBalance": 10,
+    "days": 7,
+    "slippage": 0.001
+  },
+  "advanced": {
+    "wsPriceMaxAgeMs": 5000,
+    "marketRefreshInterval": 30000,
+    "paperFeeRate": 0.01
+  }
+}
