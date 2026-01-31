@@ -1107,8 +1107,8 @@ export class Bot {
 
         this.checkCompoundLimit();
       } else {
-        // Real trading: market sell FIRST, then cancel limit order
-        // This ensures position stays protected if sell fails
+        // Real trading: cancel limit order FIRST, then market sell
+        // The limit order locks the shares, preventing market sell from working
         try {
           // SECURITY FIX: Skip stop-loss on empty order book (bid = 0)
           // This prevents triggering on temporary book clearing
@@ -1117,13 +1117,15 @@ export class Bot {
             return;
           }
 
+          // CRITICAL: Cancel limit order BEFORE market sell
+          // Limit orders lock shares, preventing them from being sold
+          if (position.limitOrderId) {
+            this.log(`[STOP-LOSS] Cancelling limit order to free shares...`);
+            await this.trader.cancelOrder(position.limitOrderId);
+          }
+
           const result = await this.trader.marketSell(tokenId, position.shares);
           if (result) {
-            // Only cancel limit order AFTER successful sell
-            if (position.limitOrderId) {
-              await this.trader.cancelOrder(position.limitOrderId);
-              this.log(`Cancelled limit order`);
-            }
 
             closeTrade(position.tradeId, result.price, "STOPPED");
             this.state.positions.delete(tokenId);
@@ -1140,8 +1142,19 @@ export class Bot {
               this.state.balance = newBalance;
             }
           } else {
-            // Sell failed - keep limit order as fallback protection
-            this.log(`[STOP-LOSS] Sell failed, keeping limit order as protection`);
+            // Sell failed - try to re-place limit order for protection
+            this.log(`[STOP-LOSS] Market sell failed, re-placing limit order for protection`);
+            try {
+              const limitResult = await this.trader.limitSell(tokenId, position.shares, this.getProfitTarget());
+              if (limitResult) {
+                position.limitOrderId = limitResult.orderId;
+                this.log(`[STOP-LOSS] Re-placed limit order @ $${this.getProfitTarget().toFixed(2)}`);
+              } else {
+                this.log(`[STOP-LOSS] CRITICAL: Failed to re-place limit order - position unprotected!`);
+              }
+            } catch (limitErr) {
+              this.log(`[STOP-LOSS] CRITICAL: Error re-placing limit order: ${limitErr}`);
+            }
           }
         } catch (err) {
           this.log(`Error executing stop-loss: ${err}`);
