@@ -393,7 +393,7 @@ export class Trader {
           if (bidCheck.reason === "empty_book") {
             console.error(`[STOP-LOSS] Order book empty (bid=0) - market may have resolved or no liquidity`);
           } else {
-            console.error(`[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.01) - market may have resolved`);
+            console.error(`[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.05) - likely bad data or resolved market`);
           }
           // Don't retry if market is likely resolved - return null to trigger redemption flow
           return null;
@@ -416,9 +416,15 @@ export class Trader {
         });
 
         if (response.success) {
+          const orderId = response.orderID || "";
+
+          // Get actual fill price instead of placement price
+          const fillInfo = await this.waitForFill(orderId, 3000);
+          const actualPrice = fillInfo?.avgPrice || validBid;
+
           return {
-            orderId: response.orderID || "",
-            price: validBid
+            orderId,
+            price: actualPrice
           };
         }
 
@@ -586,8 +592,8 @@ export class Trader {
       return { valid: false, bid, reason: "empty_book" };
     }
 
-    // Below minimum tradeable price - market likely resolved
-    if (bid < 0.01) {
+    // Below minimum tradeable price - likely bad data or resolved market
+    if (bid < 0.05) {
       return { valid: false, bid, reason: "below_minimum" };
     }
 
