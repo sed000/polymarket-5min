@@ -14,7 +14,7 @@ export interface Position {
   side: "UP" | "DOWN";
   marketSlug: string;
   marketEndDate: Date;
-  limitOrderId?: string; // Limit sell order at $0.99
+  // No limit orders - using WebSocket monitoring for profit target and stop-loss
 }
 
 export interface BotState {
@@ -888,22 +888,7 @@ export class Bot {
             this.checkCompoundLimit();
           }
         } else {
-          // Real trading: check if limit order exists and is filled
-          if (position.limitOrderId) {
-            const wsFill = this.getWsLimitFill(position.limitOrderId, position.shares);
-            if (wsFill) {
-              await this.processLimitFill(position, wsFill.avgPrice, "WS");
-              continue;
-            }
-
-            const fillInfo = await this.trader.getOrderFillInfo(position.limitOrderId);
-            if (fillInfo && fillInfo.filled) {
-              // Use ACTUAL fill price from the order, not assumed target
-              const actualExitPrice = fillInfo.avgPrice > 0 ? fillInfo.avgPrice : this.getProfitTarget();
-              await this.processLimitFill(position, actualExitPrice, "REST");
-              continue;
-            }
-          }
+          // Real trading: monitor price for profit target (no limit orders)
 
           // Skip if position has no shares (invalid state)
           if (!position.shares || position.shares < 0.01) {
@@ -913,15 +898,10 @@ export class Bot {
             continue;
           }
 
-          // No limit order OR not filled yet - check if price hit target and sell manually
+          // Check if price hit profit target - market sell immediately
           const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
-            this.log(`Price hit profit target $${wsPrice.bestBid.toFixed(2)} - selling manually`);
-
-            // Cancel existing limit order if any
-            if (position.limitOrderId) {
-              await this.trader.cancelOrder(position.limitOrderId);
-            }
+            this.log(`[TAKE-PROFIT] Price $${wsPrice.bestBid.toFixed(2)} hit target $${this.getProfitTarget().toFixed(2)} - selling`);
 
             // Market sell at current price
             const result = await this.trader.marketSell(tokenId, position.shares);
@@ -930,19 +910,11 @@ export class Bot {
               closeTrade(position.tradeId, result.price, "RESOLVED");
               this.state.positions.delete(tokenId);
 
-              this.log(`Profit taken @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+              this.log(`[TAKE-PROFIT] Sold ${position.shares.toFixed(2)} shares @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
               const newBalance = await this.trader.getBalance();
               if (newBalance !== null) {
                 this.state.balance = newBalance;
               }
-            }
-          } else if (!position.limitOrderId) {
-            // Try to place limit order if we don't have one
-            this.log(`Attempting to place missing limit order for ${position.side}...`);
-            const limitResult = await this.trader.limitSell(tokenId, position.shares, this.getProfitTarget());
-            if (limitResult) {
-              position.limitOrderId = limitResult.orderId;
-              this.log(`Limit order placed @ $${this.getProfitTarget().toFixed(2)}`);
             }
           }
         }
@@ -1013,12 +985,6 @@ export class Bot {
             // Market sell at actual bid price
             const result = await this.trader.marketSell(tokenId, position.shares);
             if (result) {
-              // Only cancel limit order AFTER successful sell
-              if (position.limitOrderId) {
-                await this.trader.cancelOrder(position.limitOrderId);
-                this.log(`Cancelled unfilled limit order`);
-              }
-
               closeTrade(position.tradeId, result.price, "RESOLVED");
               this.state.positions.delete(tokenId);
               const realPnl = (result.price - position.entryPrice) * position.shares;
@@ -1107,8 +1073,7 @@ export class Bot {
 
         this.checkCompoundLimit();
       } else {
-        // Real trading: cancel limit order FIRST, then market sell
-        // The limit order locks the shares, preventing market sell from working
+        // Real trading: market sell immediately (no limit orders to worry about)
         try {
           // SECURITY FIX: Skip stop-loss on empty order book (bid = 0)
           // This prevents triggering on temporary book clearing
@@ -1117,20 +1082,12 @@ export class Bot {
             return;
           }
 
-          // CRITICAL: Cancel limit order BEFORE market sell
-          // Limit orders lock shares, preventing them from being sold
-          if (position.limitOrderId) {
-            this.log(`[STOP-LOSS] Cancelling limit order to free shares...`);
-            await this.trader.cancelOrder(position.limitOrderId);
-          }
-
           const result = await this.trader.marketSell(tokenId, position.shares);
           if (result) {
-
             closeTrade(position.tradeId, result.price, "STOPPED");
             this.state.positions.delete(tokenId);
             const pnl = (result.price - position.entryPrice) * position.shares;
-            this.log(`Closed position @ $${result.price.toFixed(2)}. PnL: $${pnl.toFixed(2)}`, {
+            this.log(`[STOP-LOSS] Sold ${position.shares.toFixed(2)} shares @ $${result.price.toFixed(2)}. PnL: $${pnl.toFixed(2)}`, {
               marketSlug: position.marketSlug,
               tokenId: position.tokenId,
               tradeId: position.tradeId
@@ -1142,19 +1099,7 @@ export class Bot {
               this.state.balance = newBalance;
             }
           } else {
-            // Sell failed - try to re-place limit order for protection
-            this.log(`[STOP-LOSS] Market sell failed, re-placing limit order for protection`);
-            try {
-              const limitResult = await this.trader.limitSell(tokenId, position.shares, this.getProfitTarget());
-              if (limitResult) {
-                position.limitOrderId = limitResult.orderId;
-                this.log(`[STOP-LOSS] Re-placed limit order @ $${this.getProfitTarget().toFixed(2)}`);
-              } else {
-                this.log(`[STOP-LOSS] CRITICAL: Failed to re-place limit order - position unprotected!`);
-              }
-            } catch (limitErr) {
-              this.log(`[STOP-LOSS] CRITICAL: Error re-placing limit order: ${limitErr}`);
-            }
+            this.log(`[STOP-LOSS] Market sell returned null - will retry on next tick`);
           }
         } catch (err) {
           this.log(`[STOP-LOSS] Error: ${err instanceof Error ? err.message : err}`, {
@@ -1162,16 +1107,6 @@ export class Bot {
             tokenId: position.tokenId,
             tradeId: position.tradeId
           });
-          // Try to re-place limit order for protection after error
-          try {
-            const limitResult = await this.trader.limitSell(tokenId, position.shares, this.getProfitTarget());
-            if (limitResult) {
-              position.limitOrderId = limitResult.orderId;
-              this.log(`[STOP-LOSS] Re-placed limit order @ $${this.getProfitTarget().toFixed(2)} after error`);
-            }
-          } catch (limitErr) {
-            this.log(`[STOP-LOSS] CRITICAL: Could not re-place limit order: ${limitErr}`);
-          }
         }
       }
     } finally {
@@ -1416,8 +1351,8 @@ export class Bot {
             entryPrice: askPrice,
             side,
             marketSlug: market.slug,
-            marketEndDate: endDate,
-            limitOrderId: "paper-limit-" + tradeId // Simulated limit order
+            marketEndDate: endDate
+            // No limit orders - using WebSocket monitoring instead
           });
 
           // Ensure tokenId is subscribed for real-time stop-loss monitoring
@@ -1433,7 +1368,7 @@ export class Bot {
             tokenId,
             tradeId
           });
-          this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
+          this.log(`[PAPER] Monitoring for exit: profit @ $${this.getProfitTarget().toFixed(2)}, stop-loss @ $${this.getActiveConfig().stopLoss.toFixed(2)}`);
         } finally {
           // Release the reserved balance
           this.state.reservedBalance -= availableBalance;
@@ -1507,15 +1442,9 @@ export class Bot {
             this.log(`Adjusted shares: ${actualShares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
           }
 
-          // Place limit sell order at profit target (with retry logic)
-          let limitOrderId: string | undefined;
-          const limitResult = await this.trader.limitSell(tokenId, sharesToSell, this.getProfitTarget());
-          if (limitResult) {
-            limitOrderId = limitResult.orderId;
-            this.log(`Placed limit sell @ $${this.getProfitTarget().toFixed(2)} (order: ${limitOrderId.slice(0, 8)}...)`);
-          } else {
-            this.log("WARNING: Limit sell FAILED - position will only exit via stop-loss or expiry");
-          }
+          // NO LIMIT ORDER - monitor via WebSocket for profit target and stop-loss
+          // This avoids shares being locked by limit orders, which blocks stop-loss execution
+          this.log(`Monitoring for exit: profit @ $${this.getProfitTarget().toFixed(2)}, stop-loss @ $${this.getActiveConfig().stopLoss.toFixed(2)}`);
 
           // Record trade with actual position balance (accounts for fees)
           const tradeId = insertTrade({
@@ -1536,8 +1465,8 @@ export class Bot {
             entryPrice: actualEntryPrice,
             side,
             marketSlug: market.slug,
-            marketEndDate: endDate,
-            limitOrderId
+            marketEndDate: endDate
+            // No limitOrderId - using WebSocket monitoring instead
           });
 
           // Ensure tokenId is subscribed for real-time stop-loss monitoring
