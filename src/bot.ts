@@ -229,6 +229,8 @@ export class Bot {
     this.priceStream.onPrice(async (update) => {
       // Real-time stop-loss check (await to prevent race conditions)
       await this.checkStopLossRealtime(update.tokenId, update.bestBid);
+      // Real-time profit target check (await to prevent race conditions)
+      await this.checkProfitTargetRealtime(update.tokenId, update.bestBid);
       // Real-time entry check (await to prevent race conditions)
       await this.checkEntryRealtime(update.tokenId, update.bestBid, update.bestAsk);
     });
@@ -850,26 +852,12 @@ export class Bot {
   private async checkLimitOrderFills(): Promise<void> {
     for (const [tokenId, position] of this.state.positions) {
       try {
+        const profitTarget = this.getProfitTarget();
         if (this.config.paperTrading) {
           // Paper trading: check if price hit profit target
           const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
-          if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
-            // Simulate limit order fill at profit target
-            const exitPrice = this.getProfitTarget();
-            const proceeds = exitPrice * position.shares;
-            const pnl = (exitPrice - position.entryPrice) * position.shares;
-
-            closeTrade(position.tradeId, exitPrice, "RESOLVED");
-            this.state.positions.delete(tokenId);
-            this.state.balance += proceeds;
-
-            this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`, {
-              marketSlug: position.marketSlug,
-              tokenId,
-              tradeId: position.tradeId
-            });
-            this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
-            this.checkCompoundLimit();
+          if (wsPrice && wsPrice.bestBid >= profitTarget) {
+            await this.executeTakeProfit(tokenId, position, wsPrice.bestBid, "WS");
           }
         } else {
           // Real trading: monitor price for profit target (no limit orders)
@@ -884,22 +872,19 @@ export class Bot {
 
           // Check if price hit profit target - market sell immediately
           const wsPrice = this.priceStream.getPrice(tokenId, this.getWsPriceMaxAgeMs());
-          if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
-            this.log(`[TAKE-PROFIT] Price $${wsPrice.bestBid.toFixed(2)} hit target $${this.getProfitTarget().toFixed(2)} - selling`);
+          let currentBid: number | null = null;
+          let source: "WS" | "REST" = "WS";
 
-            // Market sell at current price
-            const result = await this.trader.marketSell(tokenId, position.shares);
-            if (result) {
-              const pnl = (result.price - position.entryPrice) * position.shares;
-              closeTrade(position.tradeId, result.price, "RESOLVED");
-              this.state.positions.delete(tokenId);
+          if (wsPrice) {
+            currentBid = wsPrice.bestBid;
+          } else {
+            const { bid } = await this.trader.getPrice(tokenId);
+            currentBid = bid;
+            source = "REST";
+          }
 
-              this.log(`[TAKE-PROFIT] Sold ${position.shares.toFixed(2)} shares @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-              const newBalance = await this.trader.getBalance();
-              if (newBalance !== null) {
-                this.state.balance = newBalance;
-              }
-            }
+          if (currentBid >= profitTarget) {
+            await this.executeTakeProfit(tokenId, position, currentBid, source);
           }
         }
       } catch (err) {
@@ -986,7 +971,13 @@ export class Bot {
               }
             } else {
               // Market sell failed - keep limit order as fallback
-              this.log(`Market sell failed for expired position, keeping limit order`);
+              const lastError = this.trader.getLastMarketSellError();
+              const detail = lastError ? `: ${lastError}` : "";
+              this.log(`Market sell failed for expired position${detail}, keeping limit order`, {
+                marketSlug: position.marketSlug,
+                tokenId,
+                tradeId: position.tradeId
+              });
             }
           } catch (err) {
             this.log(`Error selling expired position: ${err}`);
@@ -1012,6 +1003,25 @@ export class Bot {
     // Check if price is below stop-loss threshold - execute immediately
     if (currentBid <= activeConfig.stopLoss) {
       await this.executeStopLoss(tokenId, position, currentBid);
+    }
+  }
+
+  /**
+   * Real-time profit target check triggered by WebSocket price updates
+   * This fires IMMEDIATELY when prices change, no polling delay
+   */
+  private async checkProfitTargetRealtime(tokenId: string, currentBid: number): Promise<void> {
+    // Only check if we have a position for this token and bot is running
+    if (!this.state.running || !this.state.tradingEnabled) return;
+
+    const position = this.state.positions.get(tokenId);
+    if (!position) return;
+
+    const profitTarget = this.getProfitTarget();
+
+    // Check if price is at or above profit target - execute immediately
+    if (currentBid >= profitTarget) {
+      await this.executeTakeProfit(tokenId, position, currentBid, "WS");
     }
   }
 
@@ -1066,7 +1076,7 @@ export class Bot {
             return;
           }
 
-          const result = await this.trader.marketSell(tokenId, position.shares);
+          const result = await this.trader.marketSell(tokenId, position.shares, currentBid);
           if (result) {
             closeTrade(position.tradeId, result.price, "STOPPED");
             this.state.positions.delete(tokenId);
@@ -1083,7 +1093,13 @@ export class Bot {
               this.state.balance = newBalance;
             }
           } else {
-            this.log(`[STOP-LOSS] Market sell returned null - will retry on next tick`);
+            const lastError = this.trader.getLastMarketSellError();
+            const detail = lastError ? `: ${lastError}` : "";
+            this.log(`[STOP-LOSS] Market sell failed${detail} - will retry on next tick`, {
+              marketSlug: position.marketSlug,
+              tokenId: position.tokenId,
+              tradeId: position.tradeId
+            });
           }
         } catch (err) {
           this.log(`[STOP-LOSS] Error: ${err instanceof Error ? err.message : err}`, {
@@ -1093,6 +1109,96 @@ export class Bot {
           });
         }
       }
+    } finally {
+      // MUTEX: Always release the lock
+      this.state.pendingExits.delete(tokenId);
+    }
+  }
+
+  /**
+   * Execute profit target sell (called from real-time or polling check)
+   */
+  private async executeTakeProfit(
+    tokenId: string,
+    position: Position,
+    currentBid: number,
+    source: "WS" | "REST"
+  ): Promise<void> {
+    // MUTEX: Prevent concurrent exits for same token (race condition fix)
+    if (this.state.pendingExits.has(tokenId)) {
+      return;
+    }
+
+    // Validate position has shares
+    if (!position.shares || position.shares < 0.01) {
+      this.log(`[TAKE-PROFIT] Invalid position with 0 shares - removing`);
+      closeTrade(position.tradeId, 0, "RESOLVED");
+      this.state.positions.delete(tokenId);
+      return;
+    }
+
+    this.state.pendingExits.add(tokenId);
+
+    try {
+      const profitTarget = this.getProfitTarget();
+
+      if (this.config.paperTrading) {
+        // Paper trading: simulate limit order fill at profit target
+        const exitPrice = profitTarget;
+        const proceeds = exitPrice * position.shares;
+        const pnl = (exitPrice - position.entryPrice) * position.shares;
+
+        closeTrade(position.tradeId, exitPrice, "RESOLVED");
+        this.state.positions.delete(tokenId);
+        this.state.balance += proceeds;
+
+        this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`, {
+          marketSlug: position.marketSlug,
+          tokenId,
+          tradeId: position.tradeId
+        });
+        this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
+        this.checkCompoundLimit();
+        return;
+      }
+
+      this.log(`[TAKE-PROFIT] (${source}) Price $${currentBid.toFixed(2)} hit target $${profitTarget.toFixed(2)} - selling`, {
+        marketSlug: position.marketSlug,
+        tokenId,
+        tradeId: position.tradeId
+      });
+
+      // Market sell at current price
+      const result = await this.trader.marketSell(tokenId, position.shares, currentBid);
+      if (result) {
+        const pnl = (result.price - position.entryPrice) * position.shares;
+        closeTrade(position.tradeId, result.price, "RESOLVED");
+        this.state.positions.delete(tokenId);
+
+        this.log(`[TAKE-PROFIT] Sold ${position.shares.toFixed(2)} shares @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`, {
+          marketSlug: position.marketSlug,
+          tokenId,
+          tradeId: position.tradeId
+        });
+        const newBalance = await this.trader.getBalance();
+        if (newBalance !== null) {
+          this.state.balance = newBalance;
+        }
+      } else {
+        const lastError = this.trader.getLastMarketSellError();
+        const detail = lastError ? `: ${lastError}` : "";
+        this.log(`[TAKE-PROFIT] Market sell failed${detail} - will retry on next tick`, {
+          marketSlug: position.marketSlug,
+          tokenId,
+          tradeId: position.tradeId
+        });
+      }
+    } catch (err) {
+      this.log(`[TAKE-PROFIT] Error: ${err instanceof Error ? err.message : err}`, {
+        marketSlug: position.marketSlug,
+        tokenId,
+        tradeId: position.tradeId
+      });
     } finally {
       // MUTEX: Always release the lock
       this.state.pendingExits.delete(tokenId);
