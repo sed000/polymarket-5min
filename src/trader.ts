@@ -450,8 +450,53 @@ export class Trader {
         if (response.success) {
           const orderId = response.orderID || "";
 
-          // Get actual fill price instead of placement price
+          // Get actual fill price instead of placement price.
+          // If the order is not fully filled quickly, cancel remainder and retry later.
           const fillInfo = await this.waitForFill(orderId, 3000);
+          const initialFilledShares = fillInfo?.filledShares || 0;
+          const fullyFilled = initialFilledShares >= sharesToSell * 0.99;
+
+          if (!fullyFilled) {
+            // One extra check in case order status API lagged during waitForFill.
+            const finalInfo = await this.getOrderFillInfo(orderId);
+            const finalFilledShares = finalInfo?.filledShares || initialFilledShares;
+            const finalFullyFilled = finalFilledShares >= sharesToSell * 0.99;
+
+            if (finalFullyFilled) {
+              const actualPrice = finalInfo?.avgPrice || fillInfo?.avgPrice || validBid;
+              return {
+                orderId,
+                price: actualPrice
+              };
+            }
+
+            const cancelled = await this.cancelOrder(orderId);
+
+            // If status/fill API lagged, confirm via position balance before declaring failure.
+            const remainingBalance = await this.getPositionBalance(tokenId);
+            if (remainingBalance !== null && remainingBalance < 0.01) {
+              const actualPrice = finalInfo?.avgPrice || fillInfo?.avgPrice || validBid;
+              console.log("[STOP-LOSS] Sell appears fully filled after timeout (position balance is zero)");
+              return {
+                orderId,
+                price: actualPrice
+              };
+            }
+
+            const inferredFilledShares = remainingBalance !== null
+              ? Math.max(0, sharesToSell - remainingBalance)
+              : finalFilledShares;
+            const fillDetail = inferredFilledShares > 0
+              ? `partially filled (${inferredFilledShares.toFixed(2)}/${sharesToSell.toFixed(2)})`
+              : "not filled";
+            const errMsg = cancelled
+              ? `[STOP-LOSS] Sell ${fillDetail} within timeout - cancelled remainder and will retry`
+              : `[STOP-LOSS] Sell ${fillDetail} within timeout - cancel may have failed`;
+            this.lastMarketSellError = errMsg;
+            console.log(errMsg);
+            return null;
+          }
+
           const actualPrice = fillInfo?.avgPrice || validBid;
 
           return {

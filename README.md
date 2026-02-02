@@ -1,39 +1,42 @@
 # Polymarket Trading Bot
 
-Automated trading bot for Polymarket prediction markets with backtesting capabilities.
+Automated trading bot for Polymarket prediction markets with paper trading, backtesting, and live trading support.
 
-## Features
+**What It Does**
+- Scans markets and places trades based on your config
+- Supports `normal` and `ladder` modes
+- Paper trading and real trading
+- Backtesting and parameter optimization
+- Stores trades and logs in SQLite
 
-- Automated market scanning and trade execution
-- Backtesting engine with historical data analysis
-- Paper trading mode
-- Real-time trade tracking with SQLite database
-- WebSocket integration for live market data
+**Quick Start**
+1. `bun install`
+2. `bun dev`
+3. Edit `trading.config.json` to tune thresholds, mode, and paper balance
 
-## Setup
+**How To Use The Bot**
+- Run in paper mode first (default) and watch the terminal UI
+- Change `trading.paperTrading` to `false` for real trading
+- Adjust `activeMode` and the values under `modes` to control entries/exits
+- Config reloads automatically while the bot is running
 
-```bash
-bun install
-bun dev
-```
+**Configuration**
+- The bot uses `trading.config.json` (auto-created if missing)
+- Common settings:
+- `trading.paperTrading`, `trading.paperBalance`, `trading.maxPositions`
+- `activeMode` and `modes.normal` or `modes.ladder`
+- `backtest` settings for historical runs
 
-## Commands
+**Environment Variables (Real Trading)**
+- `PRIVATE_KEY` is required when `trading.paperTrading` is `false`
+- Optional: `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE` (auto-derived if not set)
 
-### Trading
-- `bun start` - Run the bot
-- `bun dev` - Run with auto-reload
-
-### Database
-- `bun run db:paper` - View paper trading results
-- `bun run db:real` - View real trading results
-- `bun run db:stats:paper` - View paper trading statistics
-- `bun run db:stats:real` - View real trading statistics
-
-### Backtesting
-- `bun run backtest:run` - Run backtest
-- `bun run backtest:optimize` - Optimize parameters
-- `bun run backtest:stats` - View backtest statistics
-
-## Configuration
-
-Set up your environment variables for Polymarket API access before running in real mode.
+**Commands**
+- `bun start` run the bot
+- `bun dev` run with auto-reload
+- `bun run backtest:run` run a backtest
+- `bun run backtest:optimize` optimize parameters
+- `bun run db:paper` recent paper trades
+- `bun run db:real` recent real trades
+- `bun run db:stats:paper` paper trading stats
+- `bun run db:stats:real` real trading stats
