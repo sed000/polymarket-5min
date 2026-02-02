@@ -179,6 +179,30 @@ export function closeTrade(id: number, exitPrice: number, status: "STOPPED" | "R
   }
 }
 
+/**
+ * Update an open trade's shares and cost basis (used for partial ladder sells)
+ */
+export function updateTradeShares(tradeId: number, shares: number, costBasis: number): void {
+  try {
+    const trade = getTradeById(tradeId);
+    if (!trade) {
+      console.warn(`[DB] updateTradeShares called for non-existent trade ID: ${tradeId}`);
+      return;
+    }
+    if (trade.status !== "OPEN") {
+      console.warn(`[DB] updateTradeShares called for non-open trade ID: ${tradeId}`);
+      return;
+    }
+    const database = ensureDb();
+    const stmt = database.prepare(`
+      UPDATE trades SET shares = ?, cost_basis = ? WHERE id = ?
+    `);
+    stmt.run(shares, costBasis, tradeId);
+  } catch (err) {
+    console.error(`[DB] Failed to update trade ${tradeId} shares: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
 export function getTradeById(id: number): Trade | null {
   const database = ensureDb();
   const stmt = database.prepare("SELECT * FROM trades WHERE id = ?");

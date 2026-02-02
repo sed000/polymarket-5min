@@ -189,6 +189,13 @@ function validateLadderModeConfig(modeName: string, mode: LadderModeConfig): Val
   if (!Array.isArray(mode.steps) || mode.steps.length === 0) {
     errors.push({ path: `${prefix}.steps`, message: "must have at least one step" });
   } else {
+    const firstEnabledIndex = mode.steps.findIndex(step => step.enabled);
+    if (firstEnabledIndex === -1) {
+      errors.push({ path: `${prefix}.steps`, message: "must have at least one enabled step" });
+    } else if (mode.steps[firstEnabledIndex].action !== "buy") {
+      errors.push({ path: `${prefix}.steps[${firstEnabledIndex}].action`, message: "first enabled step must be a buy" });
+    }
+
     const stepIds = new Set<string>();
     for (let i = 0; i < mode.steps.length; i++) {
       const step = mode.steps[i];
