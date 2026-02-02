@@ -29,6 +29,7 @@ export interface LadderState {
 
   // Progress tracking
   currentStepIndex: number;      // Which step we're waiting for
+  currentStepPhase: "buy" | "sell"; // Which side of the step we're waiting for
   completedSteps: string[];      // IDs of completed steps
   skippedSteps: string[];        // IDs of skipped steps (with reasons)
   skippedReasons: Map<string, string>; // stepId -> reason
@@ -703,6 +704,7 @@ export class Bot {
             marketSlug: raw.marketSlug,
             marketEndDate,
             currentStepIndex: raw.currentStepIndex ?? 0,
+            currentStepPhase: raw.currentStepPhase ?? "buy",
             completedSteps: Array.isArray(raw.completedSteps) ? raw.completedSteps : [],
             skippedSteps: Array.isArray(raw.skippedSteps) ? raw.skippedSteps : [],
             skippedReasons,
@@ -735,6 +737,7 @@ export class Bot {
         marketSlug: sortedTrades[0].market_slug,
         marketEndDate: this.parseMarketEndDate(sortedTrades[0]),
         currentStepIndex: 0,
+        currentStepPhase: "buy",
         completedSteps: [],
         skippedSteps: [],
         skippedReasons: new Map(),
@@ -1397,6 +1400,9 @@ export class Bot {
 
     const ladderState = this.state.ladderStates.get(tokenId);
     if (!ladderState) return;
+    if (!ladderState.currentStepPhase) {
+      ladderState.currentStepPhase = "buy";
+    }
 
     const ladderConfig = this.getLadderConfig();
     if (!ladderConfig) return;
@@ -1420,13 +1426,13 @@ export class Bot {
     // Priority 2: Recovery check (after stop-loss reset)
     // Wait for price to rise ABOVE first buy trigger before allowing re-entry
     if (ladderState.needsRecovery) {
-      const firstBuyStep = ladderConfig.steps.find(s => s.enabled && s.action === "buy");
-      if (firstBuyStep && hasValidAsk && currentAsk > firstBuyStep.triggerPrice) {
+      const firstBuyStep = ladderConfig.steps.find(s => s.enabled);
+      if (firstBuyStep && hasValidAsk && currentAsk > firstBuyStep.buy.triggerPrice) {
         // Price has recovered above trigger, ready to trade again
         ladderState.needsRecovery = false;
         ladderState.lastStepTime = Date.now();
         this.persistLadderState(ladderState);
-        this.log(`[LADDER] Price recovered to $${currentAsk.toFixed(2)} - ready for step 1 @ $${firstBuyStep.triggerPrice.toFixed(2)}`, {
+        this.log(`[LADDER] Price recovered to $${currentAsk.toFixed(2)} - ready for step 1 @ $${firstBuyStep.buy.triggerPrice.toFixed(2)}`, {
           marketSlug: ladderState.marketSlug,
           tokenId
         });
@@ -1437,7 +1443,7 @@ export class Bot {
     }
 
     // Get next pending step
-    const nextStep = this.getNextEnabledStep(ladderState, ladderConfig);
+    const nextStep = this.getActiveStep(ladderState, ladderConfig);
     if (!nextStep) {
       // All steps completed or skipped
       if (ladderState.status === "active") {
@@ -1461,24 +1467,25 @@ export class Bot {
       return;
     }
 
-    // Check trigger conditions based on action type
+    // Check trigger conditions based on current step phase
     // Log current step being checked (for debugging)
     const stepIndex = ladderState.currentStepIndex + 1;
     const totalSteps = ladderConfig.steps.length;
 
-    if (nextStep.action === "buy") {
+    const stepPhase = ladderState.currentStepPhase ?? "buy";
+    if (stepPhase === "buy") {
       // Buy triggers when ask price drops to or below trigger
-      if (hasValidAsk && currentAsk <= nextStep.triggerPrice) {
-        this.log(`[LADDER] Step ${stepIndex}/${totalSteps} "${nextStep.id}" triggered: ask $${currentAsk.toFixed(2)} <= $${nextStep.triggerPrice.toFixed(2)}`, {
+      if (hasValidAsk && currentAsk <= nextStep.buy.triggerPrice) {
+        this.log(`[LADDER] Step ${stepIndex}/${totalSteps} "${nextStep.id}" buy triggered: ask $${currentAsk.toFixed(2)} <= $${nextStep.buy.triggerPrice.toFixed(2)}`, {
           marketSlug: ladderState.marketSlug,
           tokenId
         });
         await this.executeLadderBuyStep(tokenId, ladderState, nextStep, currentAsk, ladderConfig);
       }
-    } else if (nextStep.action === "sell") {
+    } else if (stepPhase === "sell") {
       // Sell triggers when bid price rises to or above trigger
-      if (hasValidBid && currentBid >= nextStep.triggerPrice) {
-        this.log(`[LADDER] Step ${stepIndex}/${totalSteps} "${nextStep.id}" triggered: bid $${currentBid.toFixed(2)} >= $${nextStep.triggerPrice.toFixed(2)}`, {
+      if (hasValidBid && currentBid >= nextStep.sell.triggerPrice) {
+        this.log(`[LADDER] Step ${stepIndex}/${totalSteps} "${nextStep.id}" sell triggered: bid $${currentBid.toFixed(2)} >= $${nextStep.sell.triggerPrice.toFixed(2)}`, {
           marketSlug: ladderState.marketSlug,
           tokenId
         });
@@ -1488,10 +1495,10 @@ export class Bot {
   }
 
   /**
-   * Get the next step in sequence (strictly ordered)
+   * Get the active step in sequence (strictly ordered)
    * Only returns the step at currentStepIndex - steps MUST execute in order
    */
-  private getNextEnabledStep(ladderState: LadderState, config: LadderModeConfig): LadderStep | null {
+  private getActiveStep(ladderState: LadderState, config: LadderModeConfig): LadderStep | null {
     // Strict sequential order: only look at the current step index
     if (ladderState.currentStepIndex >= config.steps.length) {
       return null; // All steps completed
@@ -1502,19 +1509,19 @@ export class Bot {
     // Skip disabled steps
     if (!step.enabled) {
       ladderState.currentStepIndex++;
-      return this.getNextEnabledStep(ladderState, config); // Recurse to next step
+      return this.getActiveStep(ladderState, config); // Recurse to next step
     }
 
     // Skip already completed steps (safety check)
     if (ladderState.completedSteps.includes(step.id)) {
       ladderState.currentStepIndex++;
-      return this.getNextEnabledStep(ladderState, config);
+      return this.getActiveStep(ladderState, config);
     }
 
     // Skip already skipped steps
     if (ladderState.skippedSteps.includes(step.id)) {
       ladderState.currentStepIndex++;
-      return this.getNextEnabledStep(ladderState, config);
+      return this.getActiveStep(ladderState, config);
     }
 
     return step;
@@ -1567,26 +1574,24 @@ export class Bot {
    * Calculate step size based on sizeType and sizeValue
    */
   private calculateStepSize(
-    step: LadderStep,
+    side: "buy" | "sell",
+    stepConfig: { sizeType: "percent" | "fixed"; sizeValue: number },
     ladderState: LadderState,
     availableBalance: number,
     currentPrice: number
   ): number {
-    if (step.action === "buy") {
-      if (step.sizeType === "percent") {
-        return availableBalance * (step.sizeValue / 100);
-      } else {
-        return Math.min(step.sizeValue, availableBalance);
+    if (side === "buy") {
+      if (stepConfig.sizeType === "percent") {
+        return availableBalance * (stepConfig.sizeValue / 100);
       }
-    } else {
-      // sell
-      const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
-      if (step.sizeType === "percent") {
-        return remainingShares * (step.sizeValue / 100);
-      } else {
-        return Math.min(step.sizeValue / currentPrice, remainingShares);
-      }
+      return Math.min(stepConfig.sizeValue, availableBalance);
     }
+
+    const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
+    if (stepConfig.sizeType === "percent") {
+      return remainingShares * (stepConfig.sizeValue / 100);
+    }
+    return Math.min(stepConfig.sizeValue / currentPrice, remainingShares);
   }
 
   /**
@@ -1617,13 +1622,14 @@ export class Bot {
 
     try {
       const availableBalance = this.getAvailableBalance();
-      const buyAmount = this.calculateStepSize(step, ladderState, availableBalance, askPrice);
+      const buyAmount = this.calculateStepSize("buy", step.buy, ladderState, availableBalance, askPrice);
 
       // Check minimum order requirements
       const estimatedShares = buyAmount / askPrice;
       if (buyAmount < 1 || estimatedShares < MIN_ORDER_SIZE) {
         this.skipLadderStep(ladderState, step.id, "insufficient_balance");
         ladderState.currentStepIndex++;
+        ladderState.currentStepPhase = "buy";
         this.persistLadderState(ladderState);
         return;
       }
@@ -1700,6 +1706,7 @@ export class Bot {
           if (!result) {
             this.skipLadderStep(ladderState, step.id, "buy_failed");
             ladderState.currentStepIndex++;
+            ladderState.currentStepPhase = "buy";
             this.persistLadderState(ladderState);
             return;
           }
@@ -1709,6 +1716,7 @@ export class Bot {
             await this.trader.cancelOrder(result.orderId);
             this.skipLadderStep(ladderState, step.id, "order_not_filled");
             ladderState.currentStepIndex++;
+            ladderState.currentStepPhase = "buy";
             this.persistLadderState(ladderState);
             return;
           }
@@ -1769,9 +1777,8 @@ export class Bot {
         }
       }
 
-      // Mark step completed
-      ladderState.completedSteps.push(step.id);
-      ladderState.currentStepIndex++;
+      // Move to sell phase within this step
+      ladderState.currentStepPhase = "sell";
       ladderState.lastStepTime = Date.now();
       ladderState.lastStepPrice = askPrice;
       this.persistLadderState(ladderState);
@@ -1809,12 +1816,13 @@ export class Bot {
 
     try {
       const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
-      const sellShares = this.calculateStepSize(step, ladderState, 0, bidPrice);
+      const sellShares = this.calculateStepSize("sell", step.sell, ladderState, 0, bidPrice);
 
       // Check if we have shares to sell
       if (sellShares < 0.01 || remainingShares < 0.01) {
         this.skipLadderStep(ladderState, step.id, "insufficient_shares");
         ladderState.currentStepIndex++;
+        ladderState.currentStepPhase = "buy";
         this.persistLadderState(ladderState);
         return;
       }
@@ -1861,6 +1869,7 @@ export class Bot {
         if (!result) {
           this.skipLadderStep(ladderState, step.id, "sell_failed");
           ladderState.currentStepIndex++;
+          ladderState.currentStepPhase = "buy";
           this.persistLadderState(ladderState);
           return;
         }
@@ -1897,6 +1906,7 @@ export class Bot {
       // Mark step completed
       ladderState.completedSteps.push(step.id);
       ladderState.currentStepIndex++;
+      ladderState.currentStepPhase = "buy";
       ladderState.lastStepTime = Date.now();
       ladderState.lastStepPrice = bidPrice;
 
@@ -2008,7 +2018,7 @@ export class Bot {
 
       // Reset the ladder to step 1 instead of deleting it
       this.resetLadderState(ladderState);
-      this.log(`[LADDER] Reset to step 1 - waiting for new entry @ $${this.getLadderConfig()?.steps[0]?.triggerPrice.toFixed(2) || '?'}`, {
+      this.log(`[LADDER] Reset to step 1 - waiting for new entry @ $${this.getLadderConfig()?.steps[0]?.buy.triggerPrice.toFixed(2) || '?'}`, {
         marketSlug: ladderState.marketSlug,
         tokenId
       });
@@ -2024,6 +2034,7 @@ export class Bot {
    */
   private resetLadderState(ladderState: LadderState): void {
     ladderState.currentStepIndex = 0;
+    ladderState.currentStepPhase = "buy";
     ladderState.completedSteps = [];
     ladderState.skippedSteps = [];
     ladderState.skippedReasons.clear();
@@ -2055,6 +2066,7 @@ export class Bot {
       marketSlug,
       marketEndDate,
       currentStepIndex: 0,
+      currentStepPhase: "buy",
       completedSteps: [],
       skippedSteps: [],
       skippedReasons: new Map(),
@@ -2473,13 +2485,6 @@ export class Bot {
         }
 
         const firstStep = ladderConfig.steps[firstEnabledIndex];
-        if (firstStep.action !== "buy") {
-          this.log(`[LADDER] First enabled step is not a buy - skipping`, {
-            marketSlug: market.slug,
-            tokenId
-          });
-          return;
-        }
 
         // Initialize ladder state
         const ladderState = this.initializeLadderState(tokenId, side, market.slug, endDate);
@@ -2487,8 +2492,8 @@ export class Bot {
 
         // Only start ladder if price is ABOVE the first buy trigger (we want to catch the drop)
         // If price is already at or below the trigger, skip - we missed the entry
-        if (askPrice < firstStep.triggerPrice) {
-          this.log(`[LADDER] Price $${askPrice.toFixed(2)} already below first step trigger $${firstStep.triggerPrice.toFixed(2)} - skipping`, {
+        if (askPrice < firstStep.buy.triggerPrice) {
+          this.log(`[LADDER] Price $${askPrice.toFixed(2)} already below first step trigger $${firstStep.buy.triggerPrice.toFixed(2)} - skipping`, {
             marketSlug: market.slug,
             tokenId
           });
@@ -2500,7 +2505,7 @@ export class Bot {
 
         // Check if current price is exactly at the trigger (within small tolerance)
         const priceTolerance = 0.005; // $0.005 tolerance
-        if (Math.abs(askPrice - firstStep.triggerPrice) <= priceTolerance) {
+        if (Math.abs(askPrice - firstStep.buy.triggerPrice) <= priceTolerance) {
           this.log(`[LADDER] Starting ladder - first buy step triggered @ $${askPrice.toFixed(2)}`, {
             marketSlug: market.slug,
             tokenId
@@ -2510,7 +2515,7 @@ export class Bot {
           await this.executeLadderBuyStep(tokenId, ladderState, firstStep, askPrice, ladderConfig);
         } else {
           // Price is above trigger - wait for it to drop
-          this.log(`[LADDER] Waiting for first step trigger @ $${firstStep.triggerPrice.toFixed(2)} (current: $${askPrice.toFixed(2)})`, {
+          this.log(`[LADDER] Waiting for first step trigger @ $${firstStep.buy.triggerPrice.toFixed(2)} (current: $${askPrice.toFixed(2)})`, {
             marketSlug: market.slug,
             tokenId
           });

@@ -13,13 +13,17 @@ export interface ModeConfig {
 }
 
 // Ladder mode step configuration
-export interface LadderStep {
-  id: string;                    // Unique identifier (e.g., "buy1", "sell1")
-  triggerPrice: number;          // Price that triggers this step (0.01-0.99)
-  stopLoss: number;              // Stop-loss price for this step (0.01-0.99)
-  action: "buy" | "sell";        // What to do when triggered
+export interface LadderStepSideConfig {
+  triggerPrice: number;          // Price that triggers this side (0.01-0.99)
   sizeType: "percent" | "fixed"; // Percentage of balance or fixed USDC
   sizeValue: number;             // Amount (50 = 50% or $50)
+}
+
+export interface LadderStep {
+  id: string;                    // Unique identifier (e.g., "step1")
+  stopLoss: number;              // Stop-loss price for this step (0.01-0.99)
+  buy: LadderStepSideConfig;     // Buy-side config
+  sell: LadderStepSideConfig;    // Sell-side config
   enabled: boolean;              // Toggle individual steps
 }
 
@@ -184,8 +188,6 @@ function validateLadderModeConfig(modeName: string, mode: LadderModeConfig): Val
     const firstEnabledIndex = mode.steps.findIndex(step => step.enabled);
     if (firstEnabledIndex === -1) {
       errors.push({ path: `${prefix}.steps`, message: "must have at least one enabled step" });
-    } else if (mode.steps[firstEnabledIndex].action !== "buy") {
-      errors.push({ path: `${prefix}.steps[${firstEnabledIndex}].action`, message: "first enabled step must be a buy" });
     }
 
     const stepIds = new Set<string>();
@@ -202,34 +204,47 @@ function validateLadderModeConfig(modeName: string, mode: LadderModeConfig): Val
         stepIds.add(step.id);
       }
 
-      // Trigger price validation
-      if (!validateRange(step.triggerPrice, 0.01, 0.99)) {
-        errors.push({ path: `${stepPrefix}.triggerPrice`, message: "must be between 0.01 and 0.99" });
-      }
-
       // Stop-loss validation
       if (!validateRange(step.stopLoss, 0.01, 0.99)) {
         errors.push({ path: `${stepPrefix}.stopLoss`, message: "must be between 0.01 and 0.99" });
-      } else if (step.stopLoss >= step.triggerPrice) {
-        errors.push({ path: `${stepPrefix}.stopLoss`, message: "must be less than triggerPrice" });
+      } else if (step.buy && step.stopLoss >= step.buy.triggerPrice) {
+        errors.push({ path: `${stepPrefix}.stopLoss`, message: "must be less than buy.triggerPrice" });
       }
 
-      // Action validation
-      if (step.action !== "buy" && step.action !== "sell") {
-        errors.push({ path: `${stepPrefix}.action`, message: 'must be "buy" or "sell"' });
+      // Buy config validation
+      if (!step.buy || typeof step.buy !== "object") {
+        errors.push({ path: `${stepPrefix}.buy`, message: "buy config is required" });
+      } else {
+        if (!validateRange(step.buy.triggerPrice, 0.01, 0.99)) {
+          errors.push({ path: `${stepPrefix}.buy.triggerPrice`, message: "must be between 0.01 and 0.99" });
+        }
+        if (step.buy.sizeType !== "percent" && step.buy.sizeType !== "fixed") {
+          errors.push({ path: `${stepPrefix}.buy.sizeType`, message: 'must be "percent" or "fixed"' });
+        }
+        if (step.buy.sizeValue <= 0) {
+          errors.push({ path: `${stepPrefix}.buy.sizeValue`, message: "must be positive" });
+        }
+        if (step.buy.sizeType === "percent" && step.buy.sizeValue > 100) {
+          errors.push({ path: `${stepPrefix}.buy.sizeValue`, message: "percent value must be <= 100" });
+        }
       }
 
-      // Size type validation
-      if (step.sizeType !== "percent" && step.sizeType !== "fixed") {
-        errors.push({ path: `${stepPrefix}.sizeType`, message: 'must be "percent" or "fixed"' });
-      }
-
-      // Size value validation
-      if (step.sizeValue <= 0) {
-        errors.push({ path: `${stepPrefix}.sizeValue`, message: "must be positive" });
-      }
-      if (step.sizeType === "percent" && step.sizeValue > 100) {
-        errors.push({ path: `${stepPrefix}.sizeValue`, message: "percent value must be <= 100" });
+      // Sell config validation
+      if (!step.sell || typeof step.sell !== "object") {
+        errors.push({ path: `${stepPrefix}.sell`, message: "sell config is required" });
+      } else {
+        if (!validateRange(step.sell.triggerPrice, 0.01, 0.99)) {
+          errors.push({ path: `${stepPrefix}.sell.triggerPrice`, message: "must be between 0.01 and 0.99" });
+        }
+        if (step.sell.sizeType !== "percent" && step.sell.sizeType !== "fixed") {
+          errors.push({ path: `${stepPrefix}.sell.sizeType`, message: 'must be "percent" or "fixed"' });
+        }
+        if (step.sell.sizeValue <= 0) {
+          errors.push({ path: `${stepPrefix}.sell.sizeValue`, message: "must be positive" });
+        }
+        if (step.sell.sizeType === "percent" && step.sell.sizeValue > 100) {
+          errors.push({ path: `${stepPrefix}.sell.sizeValue`, message: "percent value must be <= 100" });
+        }
       }
 
       // Enabled validation (should be boolean)
