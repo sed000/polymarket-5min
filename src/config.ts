@@ -16,6 +16,7 @@ export interface ModeConfig {
 export interface LadderStep {
   id: string;                    // Unique identifier (e.g., "buy1", "sell1")
   triggerPrice: number;          // Price that triggers this step (0.01-0.99)
+  stopLoss: number;              // Stop-loss price for this step (0.01-0.99)
   action: "buy" | "sell";        // What to do when triggered
   sizeType: "percent" | "fixed"; // Percentage of balance or fixed USDC
   sizeValue: number;             // Amount (50 = 50% or $50)
@@ -32,7 +33,6 @@ export interface LadderModeConfig {
 
   // Ladder-specific
   steps: LadderStep[];           // The ladder steps array
-  globalStopLoss: number;        // Emergency exit ALL if price drops here
 }
 
 // Full trading config file structure
@@ -177,14 +177,6 @@ function validateLadderModeConfig(modeName: string, mode: LadderModeConfig): Val
     errors.push({ path: `${prefix}.entryThreshold`, message: "must be <= maxEntryPrice" });
   }
 
-  // Global stop-loss validation
-  if (!validateRange(mode.globalStopLoss, 0.01, 0.99)) {
-    errors.push({ path: `${prefix}.globalStopLoss`, message: "must be between 0.01 and 0.99" });
-  }
-  if (mode.globalStopLoss >= mode.entryThreshold) {
-    errors.push({ path: `${prefix}.globalStopLoss`, message: "must be less than entryThreshold" });
-  }
-
   // Steps validation
   if (!Array.isArray(mode.steps) || mode.steps.length === 0) {
     errors.push({ path: `${prefix}.steps`, message: "must have at least one step" });
@@ -213,6 +205,13 @@ function validateLadderModeConfig(modeName: string, mode: LadderModeConfig): Val
       // Trigger price validation
       if (!validateRange(step.triggerPrice, 0.01, 0.99)) {
         errors.push({ path: `${stepPrefix}.triggerPrice`, message: "must be between 0.01 and 0.99" });
+      }
+
+      // Stop-loss validation
+      if (!validateRange(step.stopLoss, 0.01, 0.99)) {
+        errors.push({ path: `${stepPrefix}.stopLoss`, message: "must be between 0.01 and 0.99" });
+      } else if (step.stopLoss >= step.triggerPrice) {
+        errors.push({ path: `${stepPrefix}.stopLoss`, message: "must be less than triggerPrice" });
       }
 
       // Action validation
@@ -538,11 +537,13 @@ export class ConfigManager extends EventEmitter {
   getActiveMode(): ModeConfig {
     const mode = this.config.modes[this.config.activeMode];
     if (isLadderModeConfig(mode)) {
+      const firstEnabledStep = mode.steps.find(step => step.enabled);
+      const stepStopLoss = firstEnabledStep ? firstEnabledStep.stopLoss : 0.01;
       // Return entry filter values as ModeConfig for compatibility
       return {
         entryThreshold: mode.entryThreshold,
         maxEntryPrice: mode.maxEntryPrice,
-        stopLoss: mode.globalStopLoss,
+        stopLoss: stepStopLoss,
         maxSpread: mode.maxSpread,
         timeWindowMs: mode.timeWindowMs,
         profitTarget: 0.99, // Ladder mode doesn't use profit target, use default
@@ -579,17 +580,19 @@ export class ConfigManager extends EventEmitter {
 
   /**
    * Convert to legacy BotConfig interface for compatibility
-   * For ladder mode, uses entry filters and globalStopLoss
+   * For ladder mode, uses entry filters and first enabled step stopLoss
    */
   toBotConfig(): BotConfig {
     const rawMode = this.config.modes[this.config.activeMode];
     const isLadder = isLadderModeConfig(rawMode);
     const mode = this.getActiveMode(); // This already converts ladder to compatible format
+    const firstEnabledStep = isLadder ? (rawMode as LadderModeConfig).steps.find(step => step.enabled) : null;
+    const ladderStopLoss = firstEnabledStep ? firstEnabledStep.stopLoss : mode.stopLoss;
 
     return {
       entryThreshold: mode.entryThreshold,
       maxEntryPrice: mode.maxEntryPrice,
-      stopLoss: isLadder ? (rawMode as LadderModeConfig).globalStopLoss : mode.stopLoss,
+      stopLoss: isLadder ? ladderStopLoss : mode.stopLoss,
       maxSpread: mode.maxSpread,
       timeWindowMs: mode.timeWindowMs,
       pollIntervalMs: this.config.trading.pollIntervalMs,

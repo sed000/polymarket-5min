@@ -59,7 +59,12 @@ function Header({ state, configManager }: { state: BotState; configManager: Conf
           <Text>Saved: <Text color="cyan">${state.savedProfit.toFixed(2)}</Text></Text>
         )}
         <Text>Entry: <Text color="yellow">${activeEntry.toFixed(2)}-{activeMaxEntry.toFixed(2)}</Text></Text>
-        <Text>Stop: <Text color="red">≤${activeStop.toFixed(2)}</Text></Text>
+        <Text>
+          Stop:{" "}
+          <Text color="red">
+            {isLadder ? "per-step" : `≤$${activeStop.toFixed(2)}`}
+          </Text>
+        </Text>
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
         {isLadder && activeLadders > 0 && (
           <Text>Ladders: <Text color="magenta">{activeLadders}</Text></Text>

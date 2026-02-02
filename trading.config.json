@@ -28,12 +28,11 @@
       "maxEntryPrice": 0.90,
       "maxSpread": 0.03,
       "timeWindowMs": 900000,
-      "globalStopLoss": 0.40,
       "steps": [
-        { "id": "buy1", "triggerPrice": 0.60, "action": "buy", "sizeType": "percent", "sizeValue": 100, "enabled": true },
-        { "id": "sell1", "triggerPrice": 0.70, "action": "sell", "sizeType": "percent", "sizeValue": 100, "enabled": true },
-        { "id": "buy2", "triggerPrice": 0.71, "action": "buy", "sizeType": "percent", "sizeValue": 100, "enabled": true },
-        { "id": "sell2", "triggerPrice": 0.80, "action": "sell", "sizeType": "percent", "sizeValue": 100, "enabled": true }
+        { "id": "buy1", "triggerPrice": 0.60, "stopLoss": 0.40, "action": "buy", "sizeType": "percent", "sizeValue": 100, "enabled": true },
+        { "id": "sell1", "triggerPrice": 0.70, "stopLoss": 0.40, "action": "sell", "sizeType": "percent", "sizeValue": 100, "enabled": true },
+        { "id": "buy2", "triggerPrice": 0.71, "stopLoss": 0.40, "action": "buy", "sizeType": "percent", "sizeValue": 100, "enabled": true },
+        { "id": "sell2", "triggerPrice": 0.80, "stopLoss": 0.40, "action": "sell", "sizeType": "percent", "sizeValue": 100, "enabled": true }
       ]
     }
   },

@@ -182,7 +182,11 @@ export class Bot {
     );
     if (thresholdChanges.length > 0) {
       const mode = this.configManager.getActiveMode();
-      this.log(`[CONFIG] Updated: entry=$${mode.entryThreshold.toFixed(2)}, stop=$${mode.stopLoss.toFixed(2)}`);
+      if (this.configManager.isLadderMode()) {
+        this.log(`[CONFIG] Updated: entry=$${mode.entryThreshold.toFixed(2)}, stop=per-step`);
+      } else {
+        this.log(`[CONFIG] Updated: entry=$${mode.entryThreshold.toFixed(2)}, stop=$${mode.stopLoss.toFixed(2)}`);
+      }
     }
   }
 
@@ -1400,10 +1404,11 @@ export class Bot {
     const hasValidBid = currentBid > 0;
     const hasValidAsk = currentAsk > 0;
 
-    // Priority 1: Global stop-loss (only if we have shares)
+    // Priority 1: Step stop-loss (only if we have shares)
     const hasShares = ladderState.totalShares - ladderState.totalSharesSold > 0.01;
-    if (hasShares && hasValidBid && currentBid <= ladderConfig.globalStopLoss) {
-      await this.executeLadderStopLoss(tokenId, ladderState, currentBid);
+    const stopLossStep = this.getActiveStopLossStep(ladderState, ladderConfig);
+    if (hasShares && hasValidBid && stopLossStep && currentBid <= stopLossStep.stopLoss) {
+      await this.executeLadderStopLoss(tokenId, ladderState, currentBid, stopLossStep);
       return;
     }
 
@@ -1513,6 +1518,36 @@ export class Bot {
     }
 
     return step;
+  }
+
+  /**
+   * Get the step whose stop-loss should be active right now
+   * Uses the next enabled step; if all steps are done, falls back to last enabled step
+   */
+  private getActiveStopLossStep(ladderState: LadderState, config: LadderModeConfig): LadderStep | null {
+    let index = ladderState.currentStepIndex;
+    while (index < config.steps.length) {
+      const step = config.steps[index];
+      if (!step.enabled) {
+        index++;
+        continue;
+      }
+      if (ladderState.completedSteps.includes(step.id) || ladderState.skippedSteps.includes(step.id)) {
+        index++;
+        continue;
+      }
+      return step;
+    }
+
+    // Fallback: last enabled step for safety if all steps are done
+    for (let i = config.steps.length - 1; i >= 0; i--) {
+      const step = config.steps[i];
+      if (step.enabled) {
+        return step;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -1889,10 +1924,15 @@ export class Bot {
   }
 
   /**
-   * Execute global stop-loss for ladder position (sells ALL remaining shares)
+   * Execute step stop-loss for ladder position (sells ALL remaining shares)
    * After stop-loss, resets the ladder to step 1 to allow re-entry
    */
-  private async executeLadderStopLoss(tokenId: string, ladderState: LadderState, currentBid: number): Promise<void> {
+  private async executeLadderStopLoss(
+    tokenId: string,
+    ladderState: LadderState,
+    currentBid: number,
+    step: LadderStep
+  ): Promise<void> {
     // MUTEX: Prevent concurrent operations on same token
     if (this.state.pendingExits.has(tokenId)) return;
     this.state.pendingExits.add(tokenId);
@@ -1912,7 +1952,7 @@ export class Bot {
         return;
       }
 
-      this.log(`[LADDER] GLOBAL STOP-LOSS TRIGGERED @ $${currentBid.toFixed(2)} - selling ALL ${sharesToSell.toFixed(2)} shares`, {
+      this.log(`[LADDER] STEP STOP-LOSS TRIGGERED (${step.id}) @ $${currentBid.toFixed(2)} <= $${step.stopLoss.toFixed(2)} - selling ALL ${sharesToSell.toFixed(2)} shares`, {
         marketSlug: ladderState.marketSlug,
         tokenId
       });
