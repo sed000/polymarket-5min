@@ -52,6 +52,7 @@ export class BacktestEngine {
   private savedProfit: number = 0; // Profit taken out via compound limit
   private position: SimulatedPosition | null = null;
   private ladderState: LadderState | null = null;
+  private ladderMarketLocks: Set<string> = new Set();
   private trades: BacktestTrade[] = [];
   private equityCurve: EquityPoint[] = [];
   private peakBalance: number;
@@ -75,6 +76,7 @@ export class BacktestEngine {
     this.savedProfit = 0;
     this.position = null;
     this.ladderState = null;
+    this.ladderMarketLocks = new Set();
     this.trades = [];
     this.equityCurve = [];
     this.peakBalance = this.config.startingBalance;
@@ -264,6 +266,18 @@ export class BacktestEngine {
   // LADDER MODE METHODS
   // ============================================================================
 
+  private isLadderMarketLocked(marketSlug: string): boolean {
+    return this.ladderMarketLocks.has(marketSlug);
+  }
+
+  private lockLadderMarket(marketSlug: string): void {
+    this.ladderMarketLocks.add(marketSlug);
+  }
+
+  private clearLadderMarketLock(marketSlug: string): void {
+    this.ladderMarketLocks.delete(marketSlug);
+  }
+
   private processLadderTick(tick: PriceTick, market: HistoricalMarket): void {
     const ladderSteps = this.config.ladderSteps ?? [];
     if (ladderSteps.length === 0) {
@@ -279,6 +293,7 @@ export class BacktestEngine {
 
     // No active ladder - check entry conditions
     if (this.balance < 1) return;
+    if (this.isLadderMarketLocked(market.slug)) return;
 
     const now = tick.timestamp;
     const marketEndTime = market.endDate.getTime();
@@ -363,6 +378,7 @@ export class BacktestEngine {
     if (!nextStep) {
       if (this.ladderState.status === "active") {
         this.ladderState.status = "completed";
+        this.lockLadderMarket(this.ladderState.marketSlug);
         const remainingShares = this.ladderState.totalShares - this.ladderState.totalSharesSold;
         if (remainingShares < 0.01) {
           this.ladderState = null;
@@ -600,6 +616,7 @@ export class BacktestEngine {
   ): void {
     const openShares = this.getOpenLadderShares(ladderState);
     if (openShares < 0.01) {
+      this.clearLadderMarketLock(ladderState.marketSlug);
       this.resetLadderState(ladderState);
       return;
     }
@@ -632,6 +649,7 @@ export class BacktestEngine {
     this.recordLadderTrade(trade);
 
     this.checkCompoundLimit();
+    this.clearLadderMarketLock(ladderState.marketSlug);
     this.resetLadderState(ladderState);
   }
 

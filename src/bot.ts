@@ -1480,6 +1480,7 @@ export class Bot {
       // All steps completed or skipped
       if (ladderState.status === "active") {
         ladderState.status = "completed";
+        this.lockLadderMarket(ladderState.marketSlug);
         const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
         const totalPnl = ladderState.totalSellProceeds - ladderState.totalCostBasis;
         if (remainingShares < 0.01) {
@@ -1985,6 +1986,7 @@ export class Bot {
       const sharesToSell = openShares > 0 ? openShares : remainingShares;
       if (sharesToSell < 0.01) {
         // No shares to sell, just reset the ladder
+        this.clearLadderMarketLock(ladderState.marketSlug, "stop_loss");
         this.resetLadderState(ladderState);
         this.log(`[LADDER] Reset to step 1 - waiting for new entry`, {
           marketSlug: ladderState.marketSlug,
@@ -2049,6 +2051,7 @@ export class Bot {
       }
 
       // Reset the ladder to step 1 instead of deleting it
+      this.clearLadderMarketLock(ladderState.marketSlug, "stop_loss");
       this.resetLadderState(ladderState);
       this.log(`[LADDER] Reset to step 1 - waiting for new entry @ $${this.getLadderConfig()?.steps[0]?.buy.triggerPrice.toFixed(2) || '?'}`, {
         marketSlug: ladderState.marketSlug,
