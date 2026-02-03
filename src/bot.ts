@@ -108,6 +108,7 @@ export class Bot {
   private wsLimitFills: Map<string, { filledShares: number; avgPrice: number; timestamp: number }> = new Map();
   private pendingLimitFills: Set<string> = new Set();
   private lastMarketRefresh: Date | null = null;
+  private ladderSkipReason: Map<string, string> = new Map();
 
   constructor(privateKey: string, configManager: ConfigManager, onLog: LogCallback = console.log) {
     this.configManager = configManager;
@@ -204,6 +205,19 @@ export class Bot {
       return new Date(startTimestamp + 15 * 60 * 1000);
     }
     return new Date(0);
+  }
+
+  private logLadderSkipOnce(tokenId: string, marketSlug: string, reason: string, message: string): void {
+    const lastReason = this.ladderSkipReason.get(tokenId);
+    if (lastReason === reason) {
+      return;
+    }
+    this.ladderSkipReason.set(tokenId, reason);
+    this.log(message, { marketSlug, tokenId });
+  }
+
+  private clearLadderSkipReason(tokenId: string): void {
+    this.ladderSkipReason.delete(tokenId);
   }
 
   /**
@@ -2487,6 +2501,27 @@ export class Bot {
     if (askPrice < activeConfig.entryThreshold) return;
     if ((askPrice - bidPrice) > activeConfig.maxSpread) return;
 
+    // LADDER MODE: Skip early if we already missed the first step trigger
+    let firstEnabledStep: LadderStep | null = null;
+    if (isLadder && ladderConfig) {
+      const firstEnabledIndex = ladderConfig.steps.findIndex(s => s.enabled);
+      if (firstEnabledIndex === -1) {
+        this.logLadderSkipOnce(tokenId, market.slug, "no_enabled_steps", "[LADDER] No enabled steps found - skipping");
+        return;
+      }
+      firstEnabledStep = ladderConfig.steps[firstEnabledIndex];
+      if (askPrice < firstEnabledStep.buy.triggerPrice) {
+        this.logLadderSkipOnce(
+          tokenId,
+          market.slug,
+          "below_first_trigger",
+          `[LADDER] Price $${askPrice.toFixed(2)} already below first step trigger $${firstEnabledStep.buy.triggerPrice.toFixed(2)} - skipping`
+        );
+        return;
+      }
+      this.clearLadderSkipReason(tokenId);
+    }
+
     // Only enter OPPOSITE side of last WINNING trade IN THE SAME MARKET
     const lastWinningTrade = getLastWinningTradeInMarket(market.slug, side);
     if (lastWinningTrade) return;
@@ -2514,16 +2549,11 @@ export class Bot {
           tokenId
         });
 
-        const firstEnabledIndex = ladderConfig.steps.findIndex(s => s.enabled);
-        if (firstEnabledIndex === -1) {
-          this.log(`[LADDER] No enabled steps found - skipping`, {
-            marketSlug: market.slug,
-            tokenId
-          });
+        const firstStep = firstEnabledStep ?? ladderConfig.steps.find(s => s.enabled);
+        if (!firstStep) {
+          this.logLadderSkipOnce(tokenId, market.slug, "no_enabled_steps", "[LADDER] No enabled steps found - skipping");
           return;
         }
-
-        const firstStep = ladderConfig.steps[firstEnabledIndex];
 
         // Initialize ladder state
         const ladderState = this.initializeLadderState(tokenId, side, market.slug, endDate);
@@ -2532,10 +2562,12 @@ export class Bot {
         // Only start ladder if price is ABOVE the first buy trigger (we want to catch the drop)
         // If price is already at or below the trigger, skip - we missed the entry
         if (askPrice < firstStep.buy.triggerPrice) {
-          this.log(`[LADDER] Price $${askPrice.toFixed(2)} already below first step trigger $${firstStep.buy.triggerPrice.toFixed(2)} - skipping`, {
-            marketSlug: market.slug,
-            tokenId
-          });
+          this.logLadderSkipOnce(
+            tokenId,
+            market.slug,
+            "below_first_trigger",
+            `[LADDER] Price $${askPrice.toFixed(2)} already below first step trigger $${firstStep.buy.triggerPrice.toFixed(2)} - skipping`
+          );
           return;
         }
 
