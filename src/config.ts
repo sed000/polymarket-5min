@@ -312,11 +312,6 @@ function validateConfig(config: TradingConfigFile): ValidationError[] {
   if (!config.modes[config.backtest.mode]) {
     errors.push({ path: "backtest.mode", message: `mode "${config.backtest.mode}" not found in modes` });
   }
-  // Backtest only supports normal mode (ladder mode is for live trading only)
-  const backtestMode = config.modes[config.backtest.mode];
-  if (backtestMode && isLadderModeConfig(backtestMode)) {
-    errors.push({ path: "backtest.mode", message: "backtest does not support ladder mode, use normal mode" });
-  }
   if (config.backtest.startingBalance <= 0) {
     errors.push({ path: "backtest.startingBalance", message: "must be positive" });
   }

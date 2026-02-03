@@ -2,13 +2,14 @@
 import { parseArgs } from "util";
 import type { BacktestConfig } from "./types";
 import { DEFAULT_BACKTEST_CONFIG } from "./types";
-import { type RiskMode, getConfigManager } from "../config";
+import { type RiskMode, type ModeConfig, type LadderModeConfig, type LadderStep, getConfigManager } from "../config";
 import { fetchHistoricalDataset, loadCachedDataset, getCacheStats } from "./data-fetcher";
 import { runBacktest } from "./engine";
 import {
   runOptimization,
   getQuickOptimizationRanges,
   getDetailedOptimizationRanges,
+  getLadderOptimizationRanges,
 } from "./optimizer";
 import { runGeneticOptimization } from "./genetic";
 import { printGeneticProgress, clearGeneticProgress, printGeneticReport, geneticResultToJSON, exportConfigForEnv } from "./genetic/reporter";
@@ -58,7 +59,7 @@ OPTIONS:
   --spread <price>    Max spread (default: 0.03)
   --window <ms>       Time window in ms (default: 300000)
   --balance <amount>  Starting balance (default: 100)
-  --mode <mode>       Risk mode: normal
+  --mode <mode>       Risk mode: normal | ladder
   --quick             Use quick optimization (fewer combinations)
   --force             Force re-fetch data even if cached
   --export <file>     Export results to file (csv or json)
@@ -127,18 +128,44 @@ function parseArguments() {
 }
 
 // Load backtest config from trading.config.json
-function getConfigFromFile() {
+function isLadderModeConfig(mode: ModeConfig | LadderModeConfig): mode is LadderModeConfig {
+  return "steps" in mode && Array.isArray((mode as LadderModeConfig).steps);
+}
+
+function getConfigFromFile(modeOverride?: string) {
   const configManager = getConfigManager();
   const backtestConfig = configManager.getBacktestConfig();
-  const mode = configManager.getMode(backtestConfig.mode);
+  const selectedMode = modeOverride ?? backtestConfig.mode;
+  const mode = configManager.getMode(selectedMode);
   const profitTaking = configManager.getConfig().profitTaking;
 
   if (!mode) {
-    throw new Error(`Backtest mode "${backtestConfig.mode}" not found in config file`);
+    throw new Error(`Backtest mode "${selectedMode}" not found in config file`);
+  }
+
+  if (isLadderModeConfig(mode)) {
+    const firstEnabledStep = mode.steps.find(step => step.enabled);
+    const ladderStopLoss = firstEnabledStep ? firstEnabledStep.stopLoss : 0.01;
+
+    return {
+      mode: selectedMode,
+      entryThreshold: mode.entryThreshold,
+      maxEntryPrice: mode.maxEntryPrice,
+      stopLoss: ladderStopLoss,
+      profitTarget: 0.99,
+      maxSpread: mode.maxSpread,
+      timeWindowMs: mode.timeWindowMs,
+      startingBalance: backtestConfig.startingBalance,
+      defaultDays: backtestConfig.days,
+      slippage: backtestConfig.slippage,
+      compoundLimit: profitTaking.compoundLimit,
+      baseBalance: profitTaking.baseBalance,
+      ladderSteps: mode.steps,
+    };
   }
 
   return {
-    mode: backtestConfig.mode,
+    mode: selectedMode,
     entryThreshold: mode.entryThreshold,
     maxEntryPrice: mode.maxEntryPrice,
     stopLoss: mode.stopLoss,
@@ -150,6 +177,7 @@ function getConfigFromFile() {
     slippage: backtestConfig.slippage,
     compoundLimit: profitTaking.compoundLimit,
     baseBalance: profitTaking.baseBalance,
+    ladderSteps: [],
   };
 }
 
@@ -200,12 +228,6 @@ function validateBacktestConfig(config: BacktestConfig): void {
   if (config.maxEntryPrice < 0.01 || config.maxEntryPrice > 0.99) {
     errors.push(`maxEntryPrice must be between 0.01 and 0.99 (got ${config.maxEntryPrice})`);
   }
-  if (config.stopLoss < 0.01 || config.stopLoss > 0.99) {
-    errors.push(`stopLoss must be between 0.01 and 0.99 (got ${config.stopLoss})`);
-  }
-  if (config.profitTarget < 0.01 || config.profitTarget > 0.99) {
-    errors.push(`profitTarget must be between 0.01 and 0.99 (got ${config.profitTarget})`);
-  }
   if (config.maxSpread < 0 || config.maxSpread > 0.50) {
     errors.push(`maxSpread must be between 0 and 0.50 (got ${config.maxSpread})`);
   }
@@ -216,20 +238,31 @@ function validateBacktestConfig(config: BacktestConfig): void {
     errors.push(`startingBalance must be positive (got ${config.startingBalance})`);
   }
 
-  // Logical validations
   if (config.entryThreshold >= config.maxEntryPrice) {
     errors.push(`entryThreshold (${config.entryThreshold}) must be < maxEntryPrice (${config.maxEntryPrice})`);
   }
-  if (config.stopLoss >= config.entryThreshold) {
-    errors.push(`stopLoss (${config.stopLoss}) must be < entryThreshold (${config.entryThreshold})`);
-  }
-  if (config.maxEntryPrice >= config.profitTarget) {
-    errors.push(`maxEntryPrice (${config.maxEntryPrice}) must be < profitTarget (${config.profitTarget})`);
-  }
 
-  // Risk mode validation
-  if (config.riskMode !== "normal") {
-    errors.push(`riskMode must be "normal" (got ${config.riskMode})`);
+  if (config.riskMode === "ladder") {
+    // Ladder-specific validations
+    const ladderErrors = validateLadderSteps(config.ladderSteps);
+    errors.push(...ladderErrors);
+  } else {
+    // Normal-mode validations
+    if (config.stopLoss < 0.01 || config.stopLoss > 0.99) {
+      errors.push(`stopLoss must be between 0.01 and 0.99 (got ${config.stopLoss})`);
+    }
+    if (config.profitTarget < 0.01 || config.profitTarget > 0.99) {
+      errors.push(`profitTarget must be between 0.01 and 0.99 (got ${config.profitTarget})`);
+    }
+    if (config.entryThreshold >= config.maxEntryPrice) {
+      errors.push(`entryThreshold (${config.entryThreshold}) must be < maxEntryPrice (${config.maxEntryPrice})`);
+    }
+    if (config.stopLoss >= config.entryThreshold) {
+      errors.push(`stopLoss (${config.stopLoss}) must be < entryThreshold (${config.entryThreshold})`);
+    }
+    if (config.maxEntryPrice >= config.profitTarget) {
+      errors.push(`maxEntryPrice (${config.maxEntryPrice}) must be < profitTarget (${config.profitTarget})`);
+    }
   }
 
   // Time window validation
@@ -242,10 +275,93 @@ function validateBacktestConfig(config: BacktestConfig): void {
   }
 }
 
+function validateLadderSteps(steps?: LadderStep[]): string[] {
+  const errors: string[] = [];
+
+  if (!Array.isArray(steps) || steps.length === 0) {
+    errors.push("ladderSteps must have at least one step");
+    return errors;
+  }
+
+  const firstEnabledIndex = steps.findIndex(step => step.enabled);
+  if (firstEnabledIndex === -1) {
+    errors.push("ladderSteps must have at least one enabled step");
+  }
+
+  const stepIds = new Set<string>();
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const stepPrefix = `ladderSteps[${i}]`;
+
+    if (!step.id || typeof step.id !== "string" || step.id.trim() === "") {
+      errors.push(`${stepPrefix}.id must be a non-empty string`);
+    } else if (stepIds.has(step.id)) {
+      errors.push(`${stepPrefix}.id duplicate step ID "${step.id}"`);
+    } else {
+      stepIds.add(step.id);
+    }
+
+    if (step.stopLoss < 0.01 || step.stopLoss > 0.99) {
+      errors.push(`${stepPrefix}.stopLoss must be between 0.01 and 0.99`);
+    } else if (step.buy && step.stopLoss >= step.buy.triggerPrice) {
+      errors.push(`${stepPrefix}.stopLoss must be less than buy.triggerPrice`);
+    }
+
+    if (!step.buy || typeof step.buy !== "object") {
+      errors.push(`${stepPrefix}.buy is required`);
+    } else {
+      if (step.buy.triggerPrice < 0.01 || step.buy.triggerPrice > 0.99) {
+        errors.push(`${stepPrefix}.buy.triggerPrice must be between 0.01 and 0.99`);
+      }
+      if (step.buy.sizeType !== "percent" && step.buy.sizeType !== "fixed") {
+        errors.push(`${stepPrefix}.buy.sizeType must be "percent" or "fixed"`);
+      }
+      if (step.buy.sizeValue <= 0) {
+        errors.push(`${stepPrefix}.buy.sizeValue must be positive`);
+      }
+      if (step.buy.sizeType === "percent" && step.buy.sizeValue > 100) {
+        errors.push(`${stepPrefix}.buy.sizeValue must be <= 100`);
+      }
+    }
+
+    if (!step.sell || typeof step.sell !== "object") {
+      errors.push(`${stepPrefix}.sell is required`);
+    } else {
+      if (step.sell.triggerPrice < 0.01 || step.sell.triggerPrice > 0.99) {
+        errors.push(`${stepPrefix}.sell.triggerPrice must be between 0.01 and 0.99`);
+      }
+      if (step.sell.sizeType !== "percent" && step.sell.sizeType !== "fixed") {
+        errors.push(`${stepPrefix}.sell.sizeType must be "percent" or "fixed"`);
+      }
+      if (step.sell.sizeValue <= 0) {
+        errors.push(`${stepPrefix}.sell.sizeValue must be positive`);
+      }
+      if (step.sell.sizeType === "percent" && step.sell.sizeValue > 100) {
+        errors.push(`${stepPrefix}.sell.sizeValue must be <= 100`);
+      }
+    }
+
+    if (typeof step.enabled !== "boolean") {
+      errors.push(`${stepPrefix}.enabled must be a boolean`);
+    }
+  }
+
+  return errors;
+}
+
 // Build config from arguments (config file is the base, CLI args override)
 function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDate: Date, endDate: Date): BacktestConfig {
-  const fileConfig = getConfigFromFile();
-  const mode = (args.mode || fileConfig.mode) as RiskMode;
+  const defaultFileConfig = getConfigFromFile();
+  const mode = (args.mode || defaultFileConfig.mode) as RiskMode;
+  const fileConfig = getConfigFromFile(mode);
+  const isLadder = mode === "ladder" || (fileConfig.ladderSteps?.length ?? 0) > 0;
+  const riskMode: RiskMode = isLadder ? "ladder" : mode;
+
+  if (isLadder && args.stop) {
+    console.warn(`[WARN] --stop is ignored in ladder mode; configure per-step stop-loss in trading.config.json`);
+  }
+
+  const stopLoss = isLadder ? fileConfig.stopLoss : (args.stop ? parseFloat(args.stop) : fileConfig.stopLoss);
 
   // Build config: defaults < mode preset < config file < CLI args
   const config: BacktestConfig = {
@@ -254,7 +370,7 @@ function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDat
     // Apply config file/CLI values
     entryThreshold: args.entry ? parseFloat(args.entry) : fileConfig.entryThreshold,
     maxEntryPrice: args["max-entry"] ? parseFloat(args["max-entry"]) : fileConfig.maxEntryPrice,
-    stopLoss: args.stop ? parseFloat(args.stop) : fileConfig.stopLoss,
+    stopLoss,
     maxSpread: args.spread ? parseFloat(args.spread) : fileConfig.maxSpread,
     timeWindowMs: args.window ? parseInt(args.window, 10) : fileConfig.timeWindowMs,
     profitTarget: fileConfig.profitTarget,
@@ -262,7 +378,8 @@ function buildConfig(args: ReturnType<typeof parseArguments>["values"], startDat
     slippage: fileConfig.slippage,
     compoundLimit: fileConfig.compoundLimit,
     baseBalance: fileConfig.baseBalance,
-    riskMode: mode,
+    riskMode,
+    ladderSteps: isLadder ? fileConfig.ladderSteps ?? [] : [],
     startDate,
     endDate,
   };
@@ -335,16 +452,21 @@ async function commandFetch(args: ReturnType<typeof parseArguments>["values"]) {
 // Command: optimize
 async function commandOptimize(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
+  const baseConfig = buildConfig(args, startDate, endDate);
 
   const markets = await loadOrFetchMarkets(startDate, endDate);
   if (!markets) return;
 
   console.log(`\nOptimizing on ${markets.length} markets...`);
 
-  const ranges = args.quick ? getQuickOptimizationRanges() : getDetailedOptimizationRanges();
+  const ranges =
+    baseConfig.riskMode === "ladder"
+      ? getLadderOptimizationRanges()
+      : (args.quick ? getQuickOptimizationRanges() : getDetailedOptimizationRanges());
 
   const results = await runOptimization(markets, {
     ranges,
+    baseConfig,
     startDate,
     endDate,
     onProgress: (p) => {
@@ -368,6 +490,7 @@ async function commandOptimize(args: ReturnType<typeof parseArguments>["values"]
 // Command: genetic
 async function commandGenetic(args: ReturnType<typeof parseArguments>["values"]) {
   const { startDate, endDate } = getDateRange(args);
+  const baseConfig = buildConfig(args, startDate, endDate);
 
   const markets = await loadOrFetchMarkets(startDate, endDate);
   if (!markets) return;
@@ -388,11 +511,7 @@ async function commandGenetic(args: ReturnType<typeof parseArguments>["values"])
 
   const result = await runGeneticOptimization(markets, {
     gaConfig,
-    baseConfig: {
-      startingBalance: parseFloat(args.balance || "100"),
-      startDate,
-      endDate,
-    },
+    baseConfig,
     onProgress: (p) => printGeneticProgress(p),
   });
 

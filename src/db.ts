@@ -80,6 +80,14 @@ export function initDatabase(paperTrading: boolean): void {
     }
   }
 
+  // Ladder market locks (prevent re-entry after ladder completion)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ladder_market_locks (
+      market_slug TEXT PRIMARY KEY,
+      locked_at TEXT NOT NULL
+    )
+  `);
+
   // Activity logs table for persistent logging
   db.run(`
     CREATE TABLE IF NOT EXISTS activity_logs (
@@ -298,6 +306,35 @@ export function getLastWinningTradeInMarket(marketSlug: string, side: "UP" | "DO
     ORDER BY closed_at DESC LIMIT 1
   `);
   return stmt.get(marketSlug, side) as Trade | null;
+}
+
+// ============================================================================
+// LADDER MARKET LOCKS
+// ============================================================================
+
+export function getLadderMarketLocks(): string[] {
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT market_slug FROM ladder_market_locks
+  `).all() as Array<{ market_slug: string }>;
+  return rows.map(row => row.market_slug);
+}
+
+export function setLadderMarketLock(marketSlug: string): void {
+  const database = ensureDb();
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO ladder_market_locks (market_slug, locked_at)
+    VALUES (?, ?)
+  `);
+  stmt.run(marketSlug, new Date().toISOString());
+}
+
+export function clearLadderMarketLock(marketSlug: string): void {
+  const database = ensureDb();
+  const stmt = database.prepare(`
+    DELETE FROM ladder_market_locks WHERE market_slug = ?
+  `);
+  stmt.run(marketSlug);
 }
 
 // ============================================================================
@@ -524,11 +561,31 @@ export function initBacktestDatabase(): void {
       exit_timestamp INTEGER,
       exit_reason TEXT,
       pnl REAL,
+      is_ladder_trade INTEGER DEFAULT 0,
+      ladder_step_id TEXT,
       FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
     )
   `);
 
   backtestDb.run(`CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id)`);
+
+  // Add ladder columns for existing DBs
+  try {
+    backtestDb.run("ALTER TABLE backtest_trades ADD COLUMN is_ladder_trade INTEGER DEFAULT 0");
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (!errMsg.includes("duplicate column")) {
+      console.warn(`[DB] ALTER TABLE warning: ${errMsg}`);
+    }
+  }
+  try {
+    backtestDb.run("ALTER TABLE backtest_trades ADD COLUMN ladder_step_id TEXT");
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (!errMsg.includes("duplicate column")) {
+      console.warn(`[DB] ALTER TABLE warning: ${errMsg}`);
+    }
+  }
 
   console.log(`Backtest database initialized: ${BACKTEST_DB_PATH}`);
 }
@@ -749,6 +806,8 @@ export interface BacktestTradeRow {
   exit_timestamp: number | null;
   exit_reason: string | null;
   pnl: number | null;
+  is_ladder_trade?: number;
+  ladder_step_id?: string | null;
 }
 
 export function insertBacktestTrade(
@@ -764,13 +823,14 @@ export function insertBacktestTrade(
     exitTimestamp: number;
     exitReason: string;
     pnl: number;
+    ladderStepId?: string;
   }
 ): number {
   const database = ensureBacktestDb();
   const stmt = database.prepare(`
     INSERT INTO backtest_trades
-    (run_id, market_slug, token_id, side, entry_price, exit_price, shares, entry_timestamp, exit_timestamp, exit_reason, pnl)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (run_id, market_slug, token_id, side, entry_price, exit_price, shares, entry_timestamp, exit_timestamp, exit_reason, pnl, is_ladder_trade, ladder_step_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const result = stmt.run(
     runId,
@@ -783,7 +843,9 @@ export function insertBacktestTrade(
     trade.entryTimestamp,
     trade.exitTimestamp,
     trade.exitReason,
-    trade.pnl
+    trade.pnl,
+    trade.ladderStepId ? 1 : 0,
+    trade.ladderStepId ?? null
   );
   return Number(result.lastInsertRowid);
 }

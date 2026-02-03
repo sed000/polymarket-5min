@@ -34,6 +34,8 @@ export function clearGeneticProgress(): void {
  * Print full genetic optimization report
  */
 export function printGeneticReport(result: GeneticOptimizationResult): void {
+  const isLadder = result.riskMode === "ladder";
+
   console.log("\n");
   console.log("=".repeat(80));
   console.log("              GENETIC ALGORITHM OPTIMIZATION RESULTS");
@@ -48,16 +50,21 @@ export function printGeneticReport(result: GeneticOptimizationResult): void {
   console.log(`  Population Size:     ${result.config.populationSize}`);
   console.log(`  Mutation Rate:       ${(result.config.mutationRate * 100).toFixed(0)}%`);
   console.log(`  Training Split:      ${(result.config.trainingSplit * 100).toFixed(0)}%`);
+  console.log(`  Risk Mode:           ${result.riskMode ?? "normal"}`);
 
   // Best Strategy Parameters
   console.log("\n--- Best Strategy Parameters ---");
   const genes = result.bestStrategy.genes;
   console.log(`  Entry Threshold:     $${genes.entryThreshold.toFixed(2)}`);
   console.log(`  Max Entry Price:     $${genes.maxEntryPrice.toFixed(2)}`);
-  console.log(`  Stop Loss:           $${genes.stopLoss.toFixed(2)}`);
   console.log(`  Max Spread:          $${genes.maxSpread.toFixed(3)}`);
   console.log(`  Time Window:         ${(genes.timeWindowMs / 60000).toFixed(1)} min`);
-  console.log(`  Profit Target:       $${genes.profitTarget.toFixed(2)}`);
+  if (!isLadder) {
+    console.log(`  Stop Loss:           $${genes.stopLoss.toFixed(2)}`);
+    console.log(`  Profit Target:       $${genes.profitTarget.toFixed(2)}`);
+  } else {
+    console.log(`  Ladder Steps:        fixed from trading.config.json`);
+  }
 
   // In-Sample Performance
   console.log("\n--- In-Sample Performance (Training) ---");
@@ -210,6 +217,7 @@ export function geneticResultToJSON(result: GeneticOptimizationResult): string {
       executionTimeMs: result.executionTimeMs,
     },
     config: result.config,
+    riskMode: result.riskMode ?? "normal",
   }, null, 2);
 }
 
@@ -218,17 +226,22 @@ export function geneticResultToJSON(result: GeneticOptimizationResult): string {
  */
 export function exportConfigForEnv(result: GeneticOptimizationResult): string {
   const genes = result.bestStrategy.genes;
+  const isLadder = result.riskMode === "ladder";
+  const ladderNote = isLadder ? " (ladder steps fixed in trading.config.json)" : "";
   return [
     `# Optimized trading parameters (Genetic Algorithm)`,
     `# Generated: ${new Date().toISOString()}`,
     `# Validation PnL: $${result.outOfSampleMetrics.totalPnL.toFixed(2)}`,
     `# Validation Win Rate: ${(result.outOfSampleMetrics.winRate * 100).toFixed(1)}%`,
+    `# Risk Mode: ${result.riskMode ?? "normal"}${ladderNote}`,
     ``,
     `BACKTEST_ENTRY_THRESHOLD=${genes.entryThreshold}`,
     `BACKTEST_MAX_ENTRY_PRICE=${genes.maxEntryPrice}`,
-    `BACKTEST_STOP_LOSS=${genes.stopLoss}`,
     `BACKTEST_MAX_SPREAD=${genes.maxSpread}`,
     `BACKTEST_TIME_WINDOW_MINS=${Math.round(genes.timeWindowMs / 60000)}`,
-    `BACKTEST_PROFIT_TARGET=${genes.profitTarget}`,
+    ...(isLadder ? [] : [
+      `BACKTEST_STOP_LOSS=${genes.stopLoss}`,
+      `BACKTEST_PROFIT_TARGET=${genes.profitTarget}`,
+    ]),
   ].join("\n");
 }

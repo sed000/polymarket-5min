@@ -1,4 +1,4 @@
-import type { RiskMode } from "../config";
+import type { RiskMode, LadderStep } from "../config";
 
 // Configuration for a single backtest run
 export interface BacktestConfig {
@@ -9,6 +9,7 @@ export interface BacktestConfig {
   maxSpread: number;
   timeWindowMs: number;
   profitTarget: number;
+  ladderSteps?: LadderStep[];
 
   // Simulation settings
   startingBalance: number;
@@ -66,7 +67,13 @@ export interface SimulatedPosition {
 }
 
 // Exit reasons
-export type ExitReason = "PROFIT_TARGET" | "STOP_LOSS" | "MARKET_RESOLVED" | "TIME_EXIT";
+export type ExitReason =
+  | "PROFIT_TARGET"
+  | "STOP_LOSS"
+  | "MARKET_RESOLVED"
+  | "TIME_EXIT"
+  | "LADDER_STEP_SELL"
+  | "LADDER_STOP_LOSS";
 
 // Single trade result
 export interface BacktestTrade {
@@ -80,6 +87,7 @@ export interface BacktestTrade {
   exitTimestamp: number;
   exitReason: ExitReason;
   pnl: number;
+  ladderStepId?: string;
 }
 
 // Performance metrics
@@ -193,4 +201,5 @@ export const DEFAULT_BACKTEST_CONFIG: Omit<BacktestConfig, "startDate" | "endDat
   compoundLimit: 0, // Disabled by default
   baseBalance: 10,
   riskMode: "normal",
+  ladderSteps: [],
 };

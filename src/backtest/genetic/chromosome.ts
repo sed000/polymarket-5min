@@ -90,6 +90,7 @@ export function chromosomeToConfig(
     compoundLimit: baseConfig.compoundLimit ?? 0,
     baseBalance: baseConfig.baseBalance ?? 10,
     riskMode: baseConfig.riskMode ?? "normal",
+    ladderSteps: baseConfig.ladderSteps ?? [],
     startDate: baseConfig.startDate ?? new Date(),
     endDate: baseConfig.endDate ?? new Date(),
   };

@@ -25,7 +25,7 @@ Automated trading bot for Polymarket prediction markets with paper trading, back
 - Common settings:
 - `trading.paperTrading`, `trading.paperBalance`, `trading.maxPositions`
 - `activeMode` and `modes.normal` or `modes.ladder`
-- `backtest` settings for historical runs
+- `backtest` settings for historical runs (`backtest.mode` supports `normal` or `ladder`)
 
 **Environment Variables (Real Trading)**
 - `PRIVATE_KEY` is required when `trading.paperTrading` is `false`
@@ -35,6 +35,7 @@ Automated trading bot for Polymarket prediction markets with paper trading, back
 - `bun start` run the bot
 - `bun dev` run with auto-reload
 - `bun run backtest:run` run a backtest
+- `bun run backtest:run --mode ladder` run a ladder-mode backtest
 - `bun run backtest:optimize` optimize parameters
 - `bun run db:paper` recent paper trades
 - `bun run db:real` recent real trades

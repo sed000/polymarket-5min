@@ -7,6 +7,7 @@ import type {
   PerformanceMetrics,
 } from "./types";
 import { DEFAULT_BACKTEST_CONFIG, DEFAULT_OPTIMIZATION_RANGES } from "./types";
+import type { RiskMode } from "../config";
 import { BacktestEngine } from "./engine";
 
 export interface OptimizationProgress {
@@ -23,7 +24,8 @@ export type OptimizationProgressCallback = (progress: OptimizationProgress) => v
  */
 export function generateParameterCombinations(
   ranges: OptimizationRanges,
-  baseConfig: Partial<BacktestConfig>
+  baseConfig: Partial<BacktestConfig>,
+  riskMode: RiskMode = "normal"
 ): Partial<BacktestConfig>[] {
   const combinations: Partial<BacktestConfig>[] = [];
 
@@ -64,8 +66,8 @@ export function generateParameterCombinations(
       if (entryThreshold > maxEntryPrice) continue;
 
       for (const stopLoss of stopLosses) {
-        // Skip invalid combinations where stop loss > entry threshold
-        if (stopLoss >= entryThreshold) continue;
+        // Skip invalid combinations where stop loss > entry threshold (normal mode only)
+        if (riskMode !== "ladder" && stopLoss >= entryThreshold) continue;
 
         for (const maxSpread of maxSpreads) {
           for (const timeWindowMs of timeWindows) {
@@ -99,16 +101,17 @@ export async function runOptimization(
     onProgress?: OptimizationProgressCallback;
   }
 ): Promise<OptimizationResult[]> {
-  const ranges = options.ranges ?? DEFAULT_OPTIMIZATION_RANGES;
   const baseConfig: Partial<BacktestConfig> = {
     ...DEFAULT_BACKTEST_CONFIG,
     ...options.baseConfig,
     startDate: options.startDate,
     endDate: options.endDate,
   };
+  const riskMode = baseConfig.riskMode ?? "normal";
+  const ranges = options.ranges ?? (riskMode === "ladder" ? getLadderOptimizationRanges() : DEFAULT_OPTIMIZATION_RANGES);
 
   // Generate all parameter combinations
-  const combinations = generateParameterCombinations(ranges, baseConfig);
+  const combinations = generateParameterCombinations(ranges, baseConfig, riskMode);
   console.log(`Testing ${combinations.length} parameter combinations...`);
 
   const results: OptimizationResult[] = [];
@@ -120,6 +123,7 @@ export async function runOptimization(
     // Build full config
     const config: BacktestConfig = {
       ...DEFAULT_BACKTEST_CONFIG,
+      ...baseConfig,
       ...params,
       startDate: options.startDate,
       endDate: options.endDate,
@@ -216,6 +220,18 @@ export function getDetailedOptimizationRanges(): OptimizationRanges {
     stopLoss: { min: 0.30, max: 0.80, step: 0.05 },
     maxSpread: { min: 0.02, max: 0.06, step: 0.02 },
     timeWindowMs: { min: 120000, max: 600000, step: 120000 },
+  };
+}
+
+/**
+ * Optimization ranges for ladder mode (entry filters only)
+ */
+export function getLadderOptimizationRanges(): OptimizationRanges {
+  return {
+    entryThreshold: { min: 0.60, max: 0.90, step: 0.05 },
+    maxEntryPrice: { min: 0.85, max: 0.98, step: 0.02 },
+    maxSpread: { min: 0.01, max: 0.06, step: 0.01 },
+    timeWindowMs: { min: 120000, max: 900000, step: 120000 },
   };
 }
 

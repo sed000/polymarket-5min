@@ -61,10 +61,25 @@ export function printBacktestReport(result: BacktestResult): void {
   // Configuration
   console.log("\n--- Configuration ---");
   console.log(`  Entry Range: ${formatCurrency(result.config.entryThreshold)} - ${formatCurrency(result.config.maxEntryPrice)}`);
-  console.log(`  Profit Target: ${formatCurrency(result.config.profitTarget)}`);
-  console.log(`  Stop Loss: ${formatCurrency(result.config.stopLoss)}`);
   console.log(`  Max Spread: ${formatCurrency(result.config.maxSpread)}`);
   console.log(`  Time Window: ${formatDuration(result.config.timeWindowMs)}`);
+  if (result.config.riskMode !== "ladder") {
+    console.log(`  Profit Target: ${formatCurrency(result.config.profitTarget)}`);
+    console.log(`  Stop Loss: ${formatCurrency(result.config.stopLoss)}`);
+  } else {
+    const steps = result.config.ladderSteps ?? [];
+    if (steps.length > 0) {
+      console.log(`  Ladder Steps:`);
+      for (const step of steps) {
+        console.log(
+          `    ${step.id}: buy<=${formatCurrency(step.buy.triggerPrice)} ` +
+          `sell>=${formatCurrency(step.sell.triggerPrice)} ` +
+          `stop<=${formatCurrency(step.stopLoss)} ` +
+          `enabled=${step.enabled ? "true" : "false"}`
+        );
+      }
+    }
+  }
 
   // Performance Summary
   console.log("\n--- Performance ---");
@@ -98,11 +113,17 @@ export function printBacktestReport(result: BacktestResult): void {
   const profitTargetExits = result.trades.filter(t => t.exitReason === "PROFIT_TARGET").length;
   const stopLossExits = result.trades.filter(t => t.exitReason === "STOP_LOSS").length;
   const resolvedExits = result.trades.filter(t => t.exitReason === "MARKET_RESOLVED").length;
+  const ladderStepExits = result.trades.filter(t => t.exitReason === "LADDER_STEP_SELL").length;
+  const ladderStopExits = result.trades.filter(t => t.exitReason === "LADDER_STOP_LOSS").length;
 
   console.log("\n--- Exit Breakdown ---");
   console.log(`  Profit Target: ${profitTargetExits} (${formatPercent(result.metrics.totalTrades > 0 ? profitTargetExits / result.metrics.totalTrades : 0)})`);
   console.log(`  Stop Loss: ${stopLossExits} (${formatPercent(result.metrics.totalTrades > 0 ? stopLossExits / result.metrics.totalTrades : 0)})`);
   console.log(`  Market Resolved: ${resolvedExits} (${formatPercent(result.metrics.totalTrades > 0 ? resolvedExits / result.metrics.totalTrades : 0)})`);
+  if (ladderStepExits > 0 || ladderStopExits > 0) {
+    console.log(`  Ladder Step Sells: ${ladderStepExits} (${formatPercent(result.metrics.totalTrades > 0 ? ladderStepExits / result.metrics.totalTrades : 0)})`);
+    console.log(`  Ladder Stop-Loss: ${ladderStopExits} (${formatPercent(result.metrics.totalTrades > 0 ? ladderStopExits / result.metrics.totalTrades : 0)})`);
+  }
 
   printLine("=");
   console.log("");
@@ -211,7 +232,8 @@ export function printTrades(trades: BacktestTrade[], limit: number = 20): void {
     const side = t.side.padEnd(4);
     const entry = `$${t.entryPrice.toFixed(2)}`;
     const exit = `$${t.exitPrice.toFixed(2)}`;
-    const reason = t.exitReason.padEnd(15);
+    const reasonLabel = t.ladderStepId ? `${t.exitReason}(${t.ladderStepId})` : t.exitReason;
+    const reason = reasonLabel.padEnd(15);
     const pnl = formatCurrency(t.pnl);
 
     console.log(`${date} | ${side} | ${entry} | ${exit} | ${reason} | ${pnl}`);
@@ -236,6 +258,7 @@ export function tradesToCSV(trades: BacktestTrade[]): string {
     "exit_timestamp",
     "exit_reason",
     "pnl",
+    "ladder_step_id",
   ];
 
   const rows = trades.map(t => [
@@ -249,6 +272,7 @@ export function tradesToCSV(trades: BacktestTrade[]): string {
     new Date(t.exitTimestamp).toISOString(),
     t.exitReason,
     t.pnl.toFixed(4),
+    t.ladderStepId ?? "",
   ]);
 
   return [headers.join(","), ...rows.map(r => r.join(","))].join("\n");

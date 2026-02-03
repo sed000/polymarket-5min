@@ -8,6 +8,7 @@ import type {
   SimulatedPosition,
   ExitReason,
 } from "./types";
+import type { LadderStep } from "../config";
 
 interface EquityPoint {
   timestamp: number;
@@ -19,6 +20,28 @@ interface DrawdownPoint {
   drawdown: number;
 }
 
+interface LadderState {
+  tokenId: string;
+  side: "UP" | "DOWN";
+  marketSlug: string;
+  marketEndDate: Date;
+  currentStepIndex: number;
+  currentStepPhase: "buy" | "sell";
+  completedSteps: string[];
+  skippedSteps: string[];
+  skippedReasons: Map<string, string>;
+  totalShares: number;
+  totalCostBasis: number;
+  averageEntryPrice: number;
+  totalSharesSold: number;
+  totalSellProceeds: number;
+  ladderStartTime: number;
+  lastStepTime: number;
+  lastStepPrice: number;
+  needsRecovery: boolean;
+  status: "active" | "completed" | "stopped";
+}
+
 /**
  * Core backtesting engine that simulates trading logic
  * Mirrors the exact behavior from bot.ts
@@ -28,6 +51,7 @@ export class BacktestEngine {
   private balance: number;
   private savedProfit: number = 0; // Profit taken out via compound limit
   private position: SimulatedPosition | null = null;
+  private ladderState: LadderState | null = null;
   private trades: BacktestTrade[] = [];
   private equityCurve: EquityPoint[] = [];
   private peakBalance: number;
@@ -50,6 +74,7 @@ export class BacktestEngine {
     this.balance = this.config.startingBalance;
     this.savedProfit = 0;
     this.position = null;
+    this.ladderState = null;
     this.trades = [];
     this.equityCurve = [];
     this.peakBalance = this.config.startingBalance;
@@ -86,6 +111,15 @@ export class BacktestEngine {
         }
       }
 
+      // Check if any market has expired and we have an active ladder in it
+      if (this.ladderState && !expiredMarkets.has(this.ladderState.marketSlug)) {
+        const ladderMarket = marketMap.get(this.ladderState.marketSlug);
+        if (ladderMarket && tick.timestamp >= ladderMarket.endDate.getTime()) {
+          this.closeLadderAtExpiry(ladderMarket);
+          expiredMarkets.add(this.ladderState?.marketSlug || ladderMarket.slug);
+        }
+      }
+
       // Skip ticks from expired markets
       if (expiredMarkets.has(market.slug)) {
         continue;
@@ -95,6 +129,9 @@ export class BacktestEngine {
       if (tick.timestamp >= market.endDate.getTime()) {
         if (this.position && this.position.marketSlug === market.slug) {
           this.closePositionAtExpiry(market);
+        }
+        if (this.ladderState && this.ladderState.marketSlug === market.slug) {
+          this.closeLadderAtExpiry(market);
         }
         expiredMarkets.add(market.slug);
         continue;
@@ -109,6 +146,12 @@ export class BacktestEngine {
       const market = marketMap.get(this.position.marketSlug);
       if (market) {
         this.closePositionAtExpiry(market);
+      }
+    }
+    if (this.ladderState) {
+      const market = marketMap.get(this.ladderState.marketSlug);
+      if (market) {
+        this.closeLadderAtExpiry(market);
       }
     }
 
@@ -130,6 +173,11 @@ export class BacktestEngine {
    * Process a single price tick
    */
   private processTick(tick: PriceTick, market: HistoricalMarket): void {
+    if (this.config.riskMode === "ladder") {
+      this.processLadderTick(tick, market);
+      return;
+    }
+
     // If we have a position for this token, check exit conditions
     if (this.position && this.position.tokenId === tick.tokenId) {
       // Check profit target
@@ -210,6 +258,416 @@ export class BacktestEngine {
 
     // All conditions met - enter position
     this.executeEntry(tick, market, side);
+  }
+
+  // ============================================================================
+  // LADDER MODE METHODS
+  // ============================================================================
+
+  private processLadderTick(tick: PriceTick, market: HistoricalMarket): void {
+    const ladderSteps = this.config.ladderSteps ?? [];
+    if (ladderSteps.length === 0) {
+      return;
+    }
+
+    // Active ladder state: only process ticks for its token
+    if (this.ladderState) {
+      if (tick.tokenId !== this.ladderState.tokenId) return;
+      this.processLadderStateTick(tick, market, ladderSteps);
+      return;
+    }
+
+    // No active ladder - check entry conditions
+    if (this.balance < 1) return;
+
+    const now = tick.timestamp;
+    const marketEndTime = market.endDate.getTime();
+    const timeRemaining = marketEndTime - now;
+    if (timeRemaining <= 0 || timeRemaining > this.config.timeWindowMs) {
+      return;
+    }
+
+    const spread = tick.bestAsk - tick.bestBid;
+    if (spread > this.config.maxSpread) {
+      return;
+    }
+
+    const askPrice = tick.bestAsk;
+    if (askPrice < this.config.entryThreshold || askPrice > this.config.maxEntryPrice) {
+      return;
+    }
+
+    const isUpToken = tick.tokenId === market.upTokenId;
+    const side: "UP" | "DOWN" = isUpToken ? "UP" : "DOWN";
+
+    if (
+      this.lastTrade &&
+      this.lastTrade.marketSlug === market.slug &&
+      this.lastTrade.side === side &&
+      this.lastTrade.pnl > 0
+    ) {
+      return;
+    }
+
+    const firstEnabledStep = ladderSteps.find(step => step.enabled);
+    if (!firstEnabledStep) return;
+
+    // Only start ladder if price is ABOVE the first buy trigger (we want to catch the drop)
+    if (askPrice < firstEnabledStep.buy.triggerPrice) {
+      return;
+    }
+
+    const ladderState = this.initializeLadderState(tick.tokenId, side, market.slug, market.endDate);
+    ladderState.lastStepPrice = askPrice;
+    ladderState.lastStepTime = tick.timestamp;
+    this.ladderState = ladderState;
+
+    const priceTolerance = 0.005;
+    if (Math.abs(askPrice - firstEnabledStep.buy.triggerPrice) <= priceTolerance) {
+      this.executeLadderBuyStep(tick, ladderState, firstEnabledStep);
+    }
+  }
+
+  private processLadderStateTick(
+    tick: PriceTick,
+    _market: HistoricalMarket,
+    ladderSteps: LadderStep[]
+  ): void {
+    if (!this.ladderState) return;
+
+    if (!this.ladderState.currentStepPhase) {
+      this.ladderState.currentStepPhase = "buy";
+    }
+
+    const hasShares = this.getOpenLadderShares(this.ladderState) > 0.01;
+    const stopLossStep = this.getActiveStopLossStep(this.ladderState, ladderSteps);
+    if (hasShares && stopLossStep && tick.bestBid > 0 && tick.bestBid <= stopLossStep.stopLoss) {
+      this.executeLadderStopLoss(tick, this.ladderState, stopLossStep);
+      return;
+    }
+
+    if (this.ladderState.status !== "active") return;
+
+    // Recovery gating after stop-loss
+    if (this.ladderState.needsRecovery) {
+      const firstBuyStep = ladderSteps.find(s => s.enabled);
+      if (firstBuyStep && tick.bestAsk > 0 && tick.bestAsk > firstBuyStep.buy.triggerPrice) {
+        this.ladderState.needsRecovery = false;
+        this.ladderState.lastStepTime = tick.timestamp;
+      } else {
+        return;
+      }
+    }
+
+    const nextStep = this.getActiveStep(this.ladderState, ladderSteps);
+    if (!nextStep) {
+      if (this.ladderState.status === "active") {
+        this.ladderState.status = "completed";
+        const remainingShares = this.ladderState.totalShares - this.ladderState.totalSharesSold;
+        if (remainingShares < 0.01) {
+          this.ladderState = null;
+        }
+      }
+      return;
+    }
+
+    const stepPhase = this.ladderState.currentStepPhase ?? "buy";
+    if (stepPhase === "buy") {
+      if (tick.bestAsk > 0 && tick.bestAsk <= nextStep.buy.triggerPrice) {
+        this.executeLadderBuyStep(tick, this.ladderState, nextStep);
+      }
+    } else if (stepPhase === "sell") {
+      if (tick.bestBid > 0 && tick.bestBid >= nextStep.sell.triggerPrice) {
+        this.executeLadderSellStep(tick, this.ladderState, nextStep);
+      }
+    }
+  }
+
+  private initializeLadderState(
+    tokenId: string,
+    side: "UP" | "DOWN",
+    marketSlug: string,
+    marketEndDate: Date
+  ): LadderState {
+    const now = Date.now();
+    return {
+      tokenId,
+      side,
+      marketSlug,
+      marketEndDate,
+      currentStepIndex: 0,
+      currentStepPhase: "buy",
+      completedSteps: [],
+      skippedSteps: [],
+      skippedReasons: new Map(),
+      totalShares: 0,
+      totalCostBasis: 0,
+      averageEntryPrice: 0,
+      totalSharesSold: 0,
+      totalSellProceeds: 0,
+      ladderStartTime: now,
+      lastStepTime: now,
+      lastStepPrice: 0,
+      needsRecovery: false,
+      status: "active",
+    };
+  }
+
+  private getActiveStep(ladderState: LadderState, steps: LadderStep[]): LadderStep | null {
+    if (ladderState.currentStepIndex >= steps.length) {
+      return null;
+    }
+
+    const step = steps[ladderState.currentStepIndex];
+    if (!step.enabled) {
+      ladderState.currentStepIndex++;
+      return this.getActiveStep(ladderState, steps);
+    }
+    if (ladderState.completedSteps.includes(step.id)) {
+      ladderState.currentStepIndex++;
+      return this.getActiveStep(ladderState, steps);
+    }
+    if (ladderState.skippedSteps.includes(step.id)) {
+      ladderState.currentStepIndex++;
+      return this.getActiveStep(ladderState, steps);
+    }
+
+    return step;
+  }
+
+  private getActiveStopLossStep(ladderState: LadderState, steps: LadderStep[]): LadderStep | null {
+    let index = ladderState.currentStepIndex;
+    while (index < steps.length) {
+      const step = steps[index];
+      if (!step.enabled) {
+        index++;
+        continue;
+      }
+      if (ladderState.completedSteps.includes(step.id) || ladderState.skippedSteps.includes(step.id)) {
+        index++;
+        continue;
+      }
+      return step;
+    }
+
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const step = steps[i];
+      if (step.enabled) {
+        return step;
+      }
+    }
+
+    return null;
+  }
+
+  private skipLadderStep(ladderState: LadderState, stepId: string, reason: string): void {
+    ladderState.skippedSteps.push(stepId);
+    ladderState.skippedReasons.set(stepId, reason);
+  }
+
+  private calculateStepSize(
+    side: "buy" | "sell",
+    stepConfig: { sizeType: "percent" | "fixed"; sizeValue: number },
+    ladderState: LadderState,
+    availableBalance: number,
+    currentPrice: number
+  ): number {
+    if (side === "buy") {
+      if (stepConfig.sizeType === "percent") {
+        return availableBalance * (stepConfig.sizeValue / 100);
+      }
+      return Math.min(stepConfig.sizeValue, availableBalance);
+    }
+
+    const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
+    if (stepConfig.sizeType === "percent") {
+      return remainingShares * (stepConfig.sizeValue / 100);
+    }
+    return Math.min(stepConfig.sizeValue / currentPrice, remainingShares);
+  }
+
+  private executeLadderBuyStep(
+    tick: PriceTick,
+    ladderState: LadderState,
+    step: LadderStep
+  ): void {
+    if (ladderState.completedSteps.includes(step.id)) {
+      return;
+    }
+    if (ladderState.skippedSteps.includes(step.id)) {
+      return;
+    }
+
+    const availableBalance = this.balance;
+    const buyAmount = this.calculateStepSize("buy", step.buy, ladderState, availableBalance, tick.bestAsk);
+
+    if (buyAmount < 1) {
+      this.skipLadderStep(ladderState, step.id, "insufficient_balance");
+      ladderState.currentStepIndex++;
+      ladderState.currentStepPhase = "buy";
+      return;
+    }
+
+    const entryPrice = Math.min(
+      tick.bestAsk * (1 + this.config.slippage),
+      0.99
+    );
+    const shares = buyAmount / entryPrice;
+
+    ladderState.totalShares += shares;
+    ladderState.totalCostBasis += buyAmount;
+    ladderState.averageEntryPrice = ladderState.totalCostBasis / ladderState.totalShares;
+    ladderState.lastStepTime = tick.timestamp;
+    ladderState.lastStepPrice = tick.bestAsk;
+
+    this.balance -= buyAmount;
+
+    ladderState.currentStepPhase = "sell";
+  }
+
+  private executeLadderSellStep(
+    tick: PriceTick,
+    ladderState: LadderState,
+    step: LadderStep
+  ): void {
+    if (ladderState.completedSteps.includes(step.id)) {
+      return;
+    }
+    if (ladderState.skippedSteps.includes(step.id)) {
+      return;
+    }
+
+    const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
+    const sellShares = this.calculateStepSize("sell", step.sell, ladderState, 0, tick.bestBid);
+
+    if (sellShares < 0.01 || remainingShares < 0.01) {
+      this.skipLadderStep(ladderState, step.id, "insufficient_shares");
+      ladderState.currentStepIndex++;
+      ladderState.currentStepPhase = "buy";
+      return;
+    }
+
+    const actualSellShares = Math.min(sellShares, remainingShares);
+    const proceeds = actualSellShares * tick.bestBid;
+
+    const costBasisPortion =
+      ladderState.totalShares > 0
+        ? (actualSellShares / ladderState.totalShares) * ladderState.totalCostBasis
+        : 0;
+    const pnl = proceeds - costBasisPortion;
+
+    ladderState.totalSharesSold += actualSellShares;
+    ladderState.totalSellProceeds += proceeds;
+    this.balance += proceeds;
+
+    const trade: BacktestTrade = {
+      marketSlug: ladderState.marketSlug,
+      tokenId: ladderState.tokenId,
+      side: ladderState.side,
+      entryPrice: ladderState.averageEntryPrice,
+      exitPrice: tick.bestBid,
+      shares: actualSellShares,
+      entryTimestamp: ladderState.lastStepTime,
+      exitTimestamp: tick.timestamp,
+      exitReason: "LADDER_STEP_SELL",
+      pnl,
+      ladderStepId: step.id,
+    };
+    this.recordLadderTrade(trade);
+
+    ladderState.completedSteps.push(step.id);
+    ladderState.currentStepIndex++;
+    ladderState.currentStepPhase = "buy";
+    ladderState.lastStepTime = tick.timestamp;
+    ladderState.lastStepPrice = tick.bestBid;
+
+    const remainingAfterSell = ladderState.totalShares - ladderState.totalSharesSold;
+    if (remainingAfterSell < 0.01) {
+      ladderState.totalShares = 0;
+      ladderState.totalCostBasis = 0;
+      ladderState.averageEntryPrice = 0;
+      ladderState.totalSharesSold = 0;
+      ladderState.totalSellProceeds = 0;
+    }
+
+    this.checkCompoundLimit();
+  }
+
+  private executeLadderStopLoss(
+    tick: PriceTick,
+    ladderState: LadderState,
+    step: LadderStep
+  ): void {
+    const openShares = this.getOpenLadderShares(ladderState);
+    if (openShares < 0.01) {
+      this.resetLadderState(ladderState);
+      return;
+    }
+
+    const exitPrice = Math.max(tick.bestBid * (1 - this.config.slippage), 0.01);
+    const proceeds = openShares * exitPrice;
+    const costBasisPortion =
+      ladderState.totalShares > 0
+        ? (openShares / ladderState.totalShares) * ladderState.totalCostBasis
+        : 0;
+    const pnl = proceeds - costBasisPortion;
+
+    ladderState.totalSharesSold += openShares;
+    ladderState.totalSellProceeds += proceeds;
+    this.balance += proceeds;
+
+    const trade: BacktestTrade = {
+      marketSlug: ladderState.marketSlug,
+      tokenId: ladderState.tokenId,
+      side: ladderState.side,
+      entryPrice: ladderState.averageEntryPrice,
+      exitPrice,
+      shares: openShares,
+      entryTimestamp: ladderState.lastStepTime,
+      exitTimestamp: tick.timestamp,
+      exitReason: "LADDER_STOP_LOSS",
+      pnl,
+      ladderStepId: step.id,
+    };
+    this.recordLadderTrade(trade);
+
+    this.checkCompoundLimit();
+    this.resetLadderState(ladderState);
+  }
+
+  private resetLadderState(ladderState: LadderState): void {
+    ladderState.currentStepIndex = 0;
+    ladderState.currentStepPhase = "buy";
+    ladderState.completedSteps = [];
+    ladderState.skippedSteps = [];
+    ladderState.skippedReasons.clear();
+    ladderState.totalShares = 0;
+    ladderState.totalCostBasis = 0;
+    ladderState.averageEntryPrice = 0;
+    ladderState.totalSharesSold = 0;
+    ladderState.totalSellProceeds = 0;
+    ladderState.lastStepTime = Date.now();
+    ladderState.lastStepPrice = 0;
+    ladderState.needsRecovery = true;
+    ladderState.status = "active";
+  }
+
+  private getOpenLadderShares(ladderState: LadderState): number {
+    return Math.max(0, ladderState.totalShares - ladderState.totalSharesSold);
+  }
+
+  private recordLadderTrade(trade: BacktestTrade): void {
+    this.trades.push(trade);
+    this.lastTrade = trade;
+
+    this.equityCurve.push({
+      timestamp: trade.exitTimestamp,
+      balance: this.balance,
+    });
+
+    if (this.balance > this.peakBalance) {
+      this.peakBalance = this.balance;
+    }
   }
 
   /**
@@ -333,6 +791,58 @@ export class BacktestEngine {
     }
 
     this.executeExit(exitPrice, market.endDate.getTime(), "MARKET_RESOLVED");
+  }
+
+  /**
+   * Force close ladder position at market expiry
+   */
+  private closeLadderAtExpiry(market: HistoricalMarket): void {
+    if (!this.ladderState) return;
+
+    const ladderState = this.ladderState;
+    const remainingShares = ladderState.totalShares - ladderState.totalSharesSold;
+
+    if (remainingShares < 0.01) {
+      this.ladderState = null;
+      return;
+    }
+
+    let exitPrice: number;
+    if (market.outcome === ladderState.side) {
+      exitPrice = this.config.profitTarget;
+    } else if (market.outcome) {
+      exitPrice = 0.01;
+    } else {
+      exitPrice = this.config.profitTarget;
+    }
+
+    const proceeds = remainingShares * exitPrice;
+    const costBasisPortion =
+      ladderState.totalShares > 0
+        ? (remainingShares / ladderState.totalShares) * ladderState.totalCostBasis
+        : 0;
+    const pnl = proceeds - costBasisPortion;
+
+    ladderState.totalSharesSold += remainingShares;
+    ladderState.totalSellProceeds += proceeds;
+    this.balance += proceeds;
+
+    const trade: BacktestTrade = {
+      marketSlug: ladderState.marketSlug,
+      tokenId: ladderState.tokenId,
+      side: ladderState.side,
+      entryPrice: ladderState.averageEntryPrice,
+      exitPrice,
+      shares: remainingShares,
+      entryTimestamp: ladderState.lastStepTime,
+      exitTimestamp: market.endDate.getTime(),
+      exitReason: "MARKET_RESOLVED",
+      pnl,
+    };
+    this.recordLadderTrade(trade);
+
+    this.checkCompoundLimit();
+    this.ladderState = null;
   }
 
   /**

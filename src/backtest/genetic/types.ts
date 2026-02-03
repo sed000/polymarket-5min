@@ -65,6 +65,7 @@ export interface GeneticOptimizationResult {
   convergedEarly: boolean;
   config: GeneticConfig;
   executionTimeMs: number;
+  riskMode?: string;
 }
 
 // Progress callback for UI updates
@@ -98,4 +99,13 @@ export const DEFAULT_BOUNDS: ParameterBounds = {
   maxSpread: { min: 0.02, max: 0.08 },
   timeWindowMs: { min: 60000, max: 900000 },
   profitTarget: { min: 0.98, max: 0.99 },
+};
+
+export const DEFAULT_LADDER_BOUNDS: ParameterBounds = {
+  entryThreshold: { min: 0.60, max: 0.90 },
+  maxEntryPrice: { min: 0.85, max: 0.98 },
+  stopLoss: { min: 0.01, max: 0.01 },
+  maxSpread: { min: 0.01, max: 0.06 },
+  timeWindowMs: { min: 120000, max: 900000 },
+  profitTarget: { min: 0.99, max: 0.99 },
 };

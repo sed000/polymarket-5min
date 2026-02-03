@@ -1,6 +1,6 @@
 import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc15MinMarkets, analyzeMarket, fetchMarketResolution, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
-import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, insertLog, markAsLadderTrade, updateLadderState, getTradeById, updateTradeShares, type Trade, type LogLevel } from "./db";
+import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, insertLog, markAsLadderTrade, updateLadderState, getTradeById, updateTradeShares, getLadderMarketLocks, setLadderMarketLock, clearLadderMarketLock, type Trade, type LogLevel } from "./db";
 import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
 import { type ConfigManager, type ConfigChangeEvent, type BotConfig, type LadderModeConfig, type LadderStep } from "./config";
 
@@ -75,6 +75,8 @@ export interface BotState {
   marketResolutions: Map<string, string>;
   // Ladder mode state tracking (tokenId -> LadderState)
   ladderStates: Map<string, LadderState>;
+  // Locked markets where ladder completed (marketSlug set)
+  ladderMarketLocks: Set<string>;
 }
 
 export interface WsStats {
@@ -130,7 +132,8 @@ export class Bot {
       markets: [],
       paperTrading: this.config.paperTrading,
       marketResolutions: new Map(),
-      ladderStates: new Map()
+      ladderStates: new Map(),
+      ladderMarketLocks: new Set()
     };
 
     // Subscribe to config changes for hot-reload
@@ -261,6 +264,32 @@ export class Bot {
     return this.configManager.getLadderMode();
   }
 
+  private loadLadderMarketLocks(): void {
+    const locks = getLadderMarketLocks();
+    this.state.ladderMarketLocks = new Set(locks);
+    if (locks.length > 0) {
+      this.log(`[LADDER] Loaded ${locks.length} locked market(s)`);
+    }
+  }
+
+  private isLadderMarketLocked(marketSlug: string): boolean {
+    return this.state.ladderMarketLocks.has(marketSlug);
+  }
+
+  private lockLadderMarket(marketSlug: string): void {
+    if (this.state.ladderMarketLocks.has(marketSlug)) return;
+    setLadderMarketLock(marketSlug);
+    this.state.ladderMarketLocks.add(marketSlug);
+    this.log(`[LADDER] Market locked after ladder completion`, { marketSlug });
+  }
+
+  private clearLadderMarketLock(marketSlug: string, reason: string): void {
+    if (!this.state.ladderMarketLocks.has(marketSlug)) return;
+    clearLadderMarketLock(marketSlug);
+    this.state.ladderMarketLocks.delete(marketSlug);
+    this.log(`[LADDER] Market lock cleared (${reason})`, { marketSlug });
+  }
+
   async init(): Promise<void> {
     // Fetch initial markets
     try {
@@ -271,6 +300,9 @@ export class Bot {
     } catch (err) {
       this.log("Failed to fetch markets");
     }
+
+    // Load persisted ladder market locks (prevents re-entry after completion)
+    this.loadLadderMarketLocks();
 
     // Connect WebSocket for real-time prices (market channel is public, no auth needed)
     // Set up connection state tracking
@@ -2347,6 +2379,8 @@ export class Bot {
     );
     if (!market) return;
 
+    if (this.isLadderMode() && this.isLadderMarketLocked(market.slug)) return;
+
     const activeConfig = this.getActiveConfig();
     const now = Date.now();
 
@@ -2413,6 +2447,7 @@ export class Bot {
         const tokenId = market.eligibleSide === "UP" ? market.upTokenId : market.downTokenId;
         if (this.state.positions.has(tokenId)) continue;
         if (this.state.ladderStates.has(tokenId)) continue;
+        if (this.isLadderMode() && this.isLadderMarketLocked(market.slug)) continue;
 
         await this.enterPosition(market);
       }
@@ -2436,6 +2471,7 @@ export class Bot {
 
     // EARLY EXITS (before mutex) - these checks don't need mutex protection
     // and checking them first avoids unnecessary mutex churn
+    if (isLadder && this.isLadderMarketLocked(market.slug)) return;
     if (this.state.pendingEntries.has(tokenId)) return;
     if (this.state.positions.has(tokenId)) return;
     if (this.state.ladderStates.has(tokenId)) return; // Already have ladder for this token

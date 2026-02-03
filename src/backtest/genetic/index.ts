@@ -7,7 +7,7 @@ import type {
   GenerationStats,
   ParameterBounds,
 } from "./types";
-import { DEFAULT_GA_CONFIG, DEFAULT_BOUNDS } from "./types";
+import { DEFAULT_GA_CONFIG, DEFAULT_BOUNDS, DEFAULT_LADDER_BOUNDS } from "./types";
 import { createRandomChromosome } from "./chromosome";
 import {
   tournamentSelect,
@@ -44,8 +44,10 @@ export async function runGeneticOptimization(
 
   // Merge configs
   const config: GeneticConfig = { ...DEFAULT_GA_CONFIG, ...options.gaConfig };
-  const bounds = options.bounds ?? DEFAULT_BOUNDS;
   const baseConfig = options.baseConfig ?? {};
+  const bounds =
+    options.bounds ??
+    (baseConfig.riskMode === "ladder" ? DEFAULT_LADDER_BOUNDS : DEFAULT_BOUNDS);
 
   // Split data for walk-forward validation
   const { training, validation, trainingDateRange, validationDateRange } = splitDataset(
@@ -195,6 +197,7 @@ export async function runGeneticOptimization(
     convergedEarly,
     config,
     executionTimeMs: Date.now() - startTime,
+    riskMode: baseConfig.riskMode ?? "normal",
   };
 }
 

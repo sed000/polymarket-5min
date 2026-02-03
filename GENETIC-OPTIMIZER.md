@@ -64,6 +64,8 @@ bun run backtest:genetic --days 14 --export config.env
 | Time Window | 1 - 15 min | How close to market end to trade |
 | Profit Target | $0.98 - $0.99 | Take profit price |
 
+**Ladder mode:** Genetic optimization only varies entry filters (entry threshold, max entry price, max spread, time window). Ladder steps remain fixed from `trading.config.json`.
+
 ## Understanding the Output
 
 ```
