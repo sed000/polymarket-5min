@@ -31,17 +31,24 @@
       "steps": [
         {
           "id": "step1",
-          "stopLoss": 0.40,
+          "stopLoss": 0.55,
           "enabled": true,
-          "buy": { "triggerPrice": 0.60, "sizeType": "percent", "sizeValue": 100 },
-          "sell": { "triggerPrice": 0.70, "sizeType": "percent", "sizeValue": 100 }
+          "buy": { "triggerPrice": 0.70, "sizeType": "percent", "sizeValue": 100 },
+          "sell": { "triggerPrice": 0.75, "sizeType": "percent", "sizeValue": 100 }
         },
         {
           "id": "step2",
-          "stopLoss": 0.60,
+          "stopLoss": 0.65,
           "enabled": true,
-          "buy": { "triggerPrice": 0.71, "sizeType": "percent", "sizeValue": 100 },
-          "sell": { "triggerPrice": 0.80, "sizeType": "percent", "sizeValue": 100 }
+          "buy": { "triggerPrice": 0.77, "sizeType": "percent", "sizeValue": 100 },
+          "sell": { "triggerPrice": 0.85, "sizeType": "percent", "sizeValue": 100 }
+        },
+        {
+          "id": "step3",
+          "stopLoss": 0.80,
+          "enabled": true,
+          "buy": { "triggerPrice": 0.88, "sizeType": "percent", "sizeValue": 100 },
+          "sell": { "triggerPrice": 0.93, "sizeType": "percent", "sizeValue": 100 }
         }
       ]
     }
