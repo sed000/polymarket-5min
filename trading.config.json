@@ -13,15 +13,15 @@
     "compoundLimit": 50,
     "baseBalance": 30
   },
-  "activeMode": "ladder",
+  "activeMode": "normal",
   "modes": {
     "normal": {
-      "entryThreshold": 0.95,
-      "maxEntryPrice": 0.98,
-      "stopLoss": 0.80,
+      "entryThreshold": 0.70,
+      "maxEntryPrice": 0.78,
+      "stopLoss": 0.55,
       "maxSpread": 0.03,
       "timeWindowMs": 300000,
-      "profitTarget": 0.99
+      "profitTarget": 0.80
     },
     "ladder": {
       "entryThreshold": 0.60,

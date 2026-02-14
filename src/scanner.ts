@@ -138,7 +138,7 @@ export function analyzeMarket(
   const upTokenId = upIndex >= 0 ? market.clobTokenIds[upIndex] : "";
   const downTokenId = downIndex >= 0 ? market.clobTokenIds[downIndex] : "";
 
-  // Get bid/ask from WebSocket orderbook data, with Gamma API fallback
+  // Get bid/ask from CLOB-derived prices (WS/REST), never Gamma midpoint.
   let upBid = 0, upAsk = 0;
   let downBid = 0, downAsk = 0;
 
@@ -150,24 +150,6 @@ export function analyzeMarket(
   if (priceOverrides && downTokenId && priceOverrides[downTokenId]) {
     downBid = priceOverrides[downTokenId].bestBid;
     downAsk = priceOverrides[downTokenId].bestAsk;
-  }
-
-  // SECURITY FIX: Fall back to Gamma API prices when WS prices unavailable
-  // This ensures entry scanning works even when WebSocket is down
-  if (upAsk === 0 && upIndex >= 0 && market.outcomePrices[upIndex]) {
-    const gammaPrice = parseFloat(market.outcomePrices[upIndex]);
-    if (gammaPrice > 0 && gammaPrice <= 1) {
-      // Gamma API returns mid-price, estimate bid/ask with small spread
-      upAsk = Math.min(gammaPrice + 0.005, 1);  // Add small spread
-      upBid = Math.max(gammaPrice - 0.005, 0);
-    }
-  }
-  if (downAsk === 0 && downIndex >= 0 && market.outcomePrices[downIndex]) {
-    const gammaPrice = parseFloat(market.outcomePrices[downIndex]);
-    if (gammaPrice > 0 && gammaPrice <= 1) {
-      downAsk = Math.min(gammaPrice + 0.005, 1);
-      downBid = Math.max(gammaPrice - 0.005, 0);
-    }
   }
 
   // Entry signal based on best ask (price you pay to buy)

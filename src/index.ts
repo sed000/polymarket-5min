@@ -57,7 +57,7 @@ async function main() {
           for (const [tokenId, pos] of state.positions) {
             console.log(`  - ${pos.side} @ $${pos.entryPrice.toFixed(2)} (${pos.shares.toFixed(2)} shares)`);
           }
-          console.log("Positions will continue to be managed by limit orders on Polymarket.");
+          console.log("Positions remain open on Polymarket and require bot/manual management to exit.");
         }
       } catch (err) {
         console.error("Error during shutdown:", err);

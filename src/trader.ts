@@ -1,24 +1,56 @@
-import { ClobClient, Side } from "@polymarket/clob-client";
-import { Wallet } from "ethers";
+import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
+import { constants, Contract, Wallet, providers } from "ethers";
 import { clobLimiter } from "./rate-limiter";
 
 const CLOB_API = "https://clob.polymarket.com";
+const DATA_API = "https://data-api.polymarket.com";
 const CHAIN_ID = 137; // Polygon
+const DEFAULT_RPC_URL = "https://polygon-rpc.com";
 
-// Polymarket minimum order size in shares
+// Polygon contracts used for redemption (EOA wallets only)
+const CONDITIONAL_TOKENS_ADDRESS = "0x4D97Dcd97eC945f40cF65F87097ACe5EA0476045";
+const COLLATERAL_TOKEN_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC
+const REDEEM_POSITIONS_ABI = [
+  "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)"
+];
+
+const MARKET_RULES_TTL_MS = 30_000;
+const FAST_FILL_TIMEOUT_MS = 1_500;
+
+// Fallback only. Actual minimum order size is fetched per token from CLOB.
 export const MIN_ORDER_SIZE = 5;
-
-// Fee rate for orders (in basis points)
-// feeRateBps: ORDER_FEE_RATE_BPS means max acceptable fee is 10% (1000/10000)
-// This is a ceiling - actual fees are typically ~1% for takers
-// The CLOB API uses this as a slippage/fee tolerance parameter
-export const ORDER_FEE_RATE_BPS = 1000;
 
 // Signature types for different wallet types
 // 0 = EOA (MetaMask direct)
 // 1 = Poly Proxy (Magic.link / email sign-up)
 // 2 = Gnosis Safe
 export type SignatureType = 0 | 1 | 2;
+
+interface TokenMarketRules {
+  minOrderSize: number;
+  tickSize: number;
+  fetchedAt: number;
+}
+
+export interface MarketSellResult {
+  orderId: string;
+  price: number;
+  soldShares: number;
+  fullyFilled: boolean;
+}
+
+interface RedeemablePositionRow {
+  conditionId?: string;
+  condition_id?: string;
+  redeemable?: boolean | string;
+}
+
+export interface RedeemResult {
+  attempted: number;
+  redeemed: number;
+  txHashes: string[];
+  errors: string[];
+}
 
 export interface Position {
   tokenId: string;
@@ -37,15 +69,18 @@ export interface ApiCreds {
 export class Trader {
   private client: ClobClient | null = null;
   private signer: Wallet;
+  private provider: providers.JsonRpcProvider;
   private initialized = false;
   private initError: string | null = null;
   private lastMarketSellError: string | null = null;
   private apiCreds: ApiCreds | null = null;
   private signatureType: SignatureType;
   private funderAddress: string | undefined;
+  private tokenRulesCache: Map<string, TokenMarketRules> = new Map();
 
   constructor(privateKey: string, signatureType: SignatureType = 1, funderAddress?: string) {
-    this.signer = new Wallet(privateKey);
+    this.provider = new providers.JsonRpcProvider(process.env.POLYGON_RPC_URL || DEFAULT_RPC_URL);
+    this.signer = new Wallet(privateKey, this.provider);
     this.signatureType = signatureType;
     this.funderAddress = funderAddress;
   }
@@ -60,11 +95,8 @@ export class Trader {
       const envPassphrase = process.env.POLY_API_PASSPHRASE;
 
       if (envKey && envSecret && envPassphrase) {
-        // Use provided credentials
         creds = { key: envKey, secret: envSecret, passphrase: envPassphrase };
       } else {
-        // Auto-generate credentials from wallet
-        // For proxy wallets, need to pass funder address
         const tempClient = new ClobClient(
           CLOB_API,
           CHAIN_ID,
@@ -73,29 +105,25 @@ export class Trader {
           this.signatureType,
           this.funderAddress
         );
-        // Use createOrDeriveApiKey - creates if not exists, derives if exists
         creds = await tempClient.createOrDeriveApiKey();
       }
 
-      // Store credentials for WebSocket auth
       this.apiCreds = {
         key: creds.key,
         secret: creds.secret,
         passphrase: creds.passphrase
       };
 
-      // Create authenticated client with funder address for proxy wallets
       this.client = new ClobClient(
         CLOB_API,
         CHAIN_ID,
         this.signer,
         creds,
-        this.signatureType, // 0=EOA, 1=Poly Proxy (Magic.link), 2=Gnosis Safe
-        this.funderAddress  // Proxy wallet address (required for signature type 1)
+        this.signatureType,
+        this.funderAddress
       );
       this.initialized = true;
     } catch (err: any) {
-      // Extract clean error message
       if (err?.response?.data?.error) {
         this.initError = err.response.data.error;
       } else if (err?.message) {
@@ -103,7 +131,6 @@ export class Trader {
       } else {
         this.initError = "Could not connect to CLOB API";
       }
-      // Don't log verbose error - it's handled in bot.ts
     }
   }
 
@@ -132,15 +159,77 @@ export class Trader {
     return msg.includes("balance") || msg.includes("allowance");
   }
 
+  private parsePositiveNumber(value: unknown): number | null {
+    const parsed = typeof value === "number" ? value : parseFloat(String(value ?? ""));
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return parsed;
+  }
+
+  private clampPriceToTick(price: number, tickSize: number): number {
+    const bounded = Math.min(1 - tickSize, Math.max(tickSize, price));
+    const ticks = Math.floor(bounded / tickSize);
+    return Number((ticks * tickSize).toFixed(6));
+  }
+
+  private async fetchTokenMarketRules(tokenId: string): Promise<TokenMarketRules> {
+    const now = Date.now();
+    const cached = this.tokenRulesCache.get(tokenId);
+    if (cached && now - cached.fetchedAt < MARKET_RULES_TTL_MS) {
+      return cached;
+    }
+
+    const fallback: TokenMarketRules = {
+      minOrderSize: MIN_ORDER_SIZE,
+      tickSize: 0.01,
+      fetchedAt: now
+    };
+
+    try {
+      let book: any;
+      if (this.client) {
+        await clobLimiter.acquire();
+        book = await this.client.getOrderBook(tokenId);
+      } else {
+        await clobLimiter.acquire();
+        const res = await fetch(`${CLOB_API}/book?token_id=${tokenId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        book = await res.json();
+      }
+
+      const minOrderSize = this.parsePositiveNumber(book?.min_order_size) ?? MIN_ORDER_SIZE;
+      const tickSize = this.parsePositiveNumber(book?.tick_size) ?? 0.01;
+
+      const rules: TokenMarketRules = {
+        minOrderSize,
+        tickSize,
+        fetchedAt: now
+      };
+      this.tokenRulesCache.set(tokenId, rules);
+      return rules;
+    } catch {
+      this.tokenRulesCache.set(tokenId, fallback);
+      return fallback;
+    }
+  }
+
+  async getMinOrderSize(tokenId: string): Promise<number> {
+    const rules = await this.fetchTokenMarketRules(tokenId);
+    return rules.minOrderSize;
+  }
+
+  async getTickSize(tokenId: string): Promise<number> {
+    const rules = await this.fetchTokenMarketRules(tokenId);
+    return rules.tickSize;
+  }
+
   private async validateAndAdjustShares(
     tokenId: string,
     shares: number,
     logPrefix = ""
-  ): Promise<number | null> {
+  ): Promise<{ sharesToSell: number; minOrderSize: number } | null> {
     const positionBalance = await this.getPositionBalance(tokenId);
     const prefix = logPrefix ? `${logPrefix} ` : "";
 
-    // Handle API error
     if (positionBalance === null) {
       console.error(`${prefix}API error fetching position balance`);
       return null;
@@ -152,35 +241,32 @@ export class Trader {
     }
 
     const sharesToSell = Math.min(shares, positionBalance);
-
     if (sharesToSell < 0.01) {
       console.error(`${prefix}Shares to sell too small: ${sharesToSell.toFixed(4)}`);
       return null;
     }
 
-    if (sharesToSell < MIN_ORDER_SIZE) {
-      console.error(`${prefix}Actual balance ${sharesToSell.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares`);
+    const minOrderSize = await this.getMinOrderSize(tokenId);
+    if (sharesToSell < minOrderSize) {
+      console.error(`${prefix}Actual balance ${sharesToSell.toFixed(4)} below token minimum ${minOrderSize.toFixed(4)} shares`);
       return null;
     }
 
     if (sharesToSell < shares * 0.99) {
-      console.log(`${prefix}Adjusted sell: ${shares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
+      console.log(`${prefix}Adjusted sell: ${shares.toFixed(2)} -> ${sharesToSell.toFixed(2)} (actual balance)`);
     }
 
-    return sharesToSell;
+    return { sharesToSell, minOrderSize };
   }
 
   async getBalance(): Promise<number | null> {
     const client = this.ensureClient();
-    // Get USDC balance from the exchange
     try {
       await clobLimiter.acquire();
       const balances = await client.getBalanceAllowance({
         asset_type: "COLLATERAL"
       });
       const rawBalance = parseFloat(balances.balance || "0");
-      // USDC has 6 decimals on Polygon - API returns raw micro-units
-      // 22828636 micro-USDC = $22.83
       return rawBalance / 1_000_000;
     } catch (err) {
       console.error(`[Trader] getBalance API error: ${err instanceof Error ? err.message : err}`);
@@ -200,8 +286,6 @@ export class Trader {
         asset_type: "CONDITIONAL",
         token_id: tokenId
       });
-      // Conditional token balances are returned in micro-units (6 decimals)
-      // Convert to shares by dividing by 1e6
       const rawBalance = parseFloat(balances.balance || "0");
       return rawBalance / 1e6;
     } catch (err) {
@@ -216,7 +300,7 @@ export class Trader {
    */
   async waitForPositionBalance(tokenId: string, minShares: number, timeoutMs: number = 15000): Promise<boolean> {
     const startTime = Date.now();
-    const pollInterval = 1000; // Check every 1 second
+    const pollInterval = 1000;
     let consecutiveErrors = 0;
     const maxConsecutiveErrors = 3;
 
@@ -234,7 +318,7 @@ export class Trader {
       }
 
       consecutiveErrors = 0;
-      if (balance >= minShares * 0.99) { // Allow 1% tolerance for rounding
+      if (balance >= minShares * 0.99) {
         return true;
       }
       await new Promise(resolve => setTimeout(resolve, pollInterval));
@@ -262,23 +346,24 @@ export class Trader {
   async buy(tokenId: string, price: number, usdcAmount: number): Promise<{ orderId: string; shares: number } | null> {
     const client = this.ensureClient();
 
-    // Validate price is within Polymarket's allowed range (0.01 - 0.99)
-    if (price < 0.01 || price > 0.99) {
-      console.error(`Invalid buy price: $${price.toFixed(4)} (must be 0.01-0.99)`);
+    if (price < 0.0001 || price >= 1) {
+      console.error(`Invalid buy price: $${price.toFixed(4)}`);
       return null;
     }
 
-    // Calculate shares: shares = usdc / price
-    const shares = Math.floor((usdcAmount / price) * 100) / 100; // Round down to 2 decimals
+    const rules = await this.fetchTokenMarketRules(tokenId);
+    const limitPrice = this.clampPriceToTick(price, rules.tickSize);
+    const shares = Math.floor((usdcAmount / limitPrice) * 100) / 100;
 
     if (shares <= 0) {
       console.error("Insufficient funds for purchase");
       return null;
     }
 
-    // Polymarket minimum order size is 5 shares
-    if (shares < MIN_ORDER_SIZE) {
-      console.error(`Order size ${shares.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares (need $${(MIN_ORDER_SIZE * price).toFixed(2)} USDC)`);
+    if (shares < rules.minOrderSize) {
+      console.error(
+        `Order size ${shares.toFixed(2)} below token minimum ${rules.minOrderSize.toFixed(2)} shares (need ~$${(rules.minOrderSize * limitPrice).toFixed(2)} USDC)`
+      );
       return null;
     }
 
@@ -286,10 +371,9 @@ export class Trader {
       await clobLimiter.acquire();
       const response = await client.createAndPostOrder({
         tokenID: tokenId,
-        price,
+        price: limitPrice,
         size: shares,
-        side: Side.BUY,
-        feeRateBps: ORDER_FEE_RATE_BPS
+        side: Side.BUY
       });
 
       if (response.success) {
@@ -309,48 +393,38 @@ export class Trader {
   async limitSell(tokenId: string, shares: number, price: number, maxRetries: number = 3): Promise<{ orderId: string; price: number } | null> {
     const client = this.ensureClient();
 
-    // Validate input shares
     if (!shares || shares < 0.01) {
       console.error(`Invalid shares to sell: ${shares}`);
       return null;
     }
 
-    // Polymarket minimum order size is 5 shares
-    if (shares < MIN_ORDER_SIZE) {
-      console.error(`Limit sell size ${shares.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares - position too small to sell`);
-      return null;
-    }
-
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const sharesToSell = await this.validateAndAdjustShares(tokenId, shares, "");
-        if (sharesToSell === null) return null;
+        const adjusted = await this.validateAndAdjustShares(tokenId, shares, "");
+        if (!adjusted) return null;
 
-        // Validate price is within Polymarket's allowed range (0.01 - 0.99)
-        if (price < 0.01 || price > 0.99) {
-          console.error(`Invalid limit price: $${price.toFixed(4)} (must be 0.01-0.99)`);
-          return null;
-        }
+        const tickSize = await this.getTickSize(tokenId);
+        const limitPrice = this.clampPriceToTick(price, tickSize);
 
         await clobLimiter.acquire();
         const response = await client.createAndPostOrder({
           tokenID: tokenId,
-          price,
-          size: sharesToSell,
-          side: Side.SELL,
-          feeRateBps: ORDER_FEE_RATE_BPS
+          price: limitPrice,
+          size: adjusted.sharesToSell,
+          side: Side.SELL
         });
 
         if (response.success) {
           return {
             orderId: response.orderID || "",
-            price
+            price: limitPrice
           };
         }
 
         if (this.isBalanceAllowanceError(response.errorMsg || "")) {
-          console.log(`Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 2000);
+          console.log(`Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
 
@@ -358,8 +432,9 @@ export class Trader {
         return null;
       } catch (err: any) {
         if (this.isBalanceAllowanceError(err?.toString() || "")) {
-          console.log(`Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 2000);
+          console.log(`Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
         console.error("Limit sell error:", err);
@@ -376,165 +451,102 @@ export class Trader {
     shares: number,
     bidOverride?: number,
     maxRetries: number = 3
-  ): Promise<{ orderId: string; price: number } | null> {
+  ): Promise<MarketSellResult | null> {
     const client = this.ensureClient();
     this.lastMarketSellError = null;
 
-    // Validate input shares
     if (!shares || shares < 0.01) {
       const errMsg = `[STOP-LOSS] Invalid shares to sell: ${shares}`;
       this.lastMarketSellError = errMsg;
-      console.error(errMsg);
-      throw new Error(errMsg);
-    }
-
-    // Polymarket minimum order size is 5 shares
-    if (shares < MIN_ORDER_SIZE) {
-      const errMsg = `[STOP-LOSS] Sell size ${shares.toFixed(2)} below minimum ${MIN_ORDER_SIZE} shares - position too small to sell`;
-      this.lastMarketSellError = errMsg;
-      console.error(errMsg);
       throw new Error(errMsg);
     }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const sharesToSell = await this.validateAndAdjustShares(tokenId, shares, "[STOP-LOSS]");
-        if (sharesToSell === null) {
-          throw new Error(`[STOP-LOSS] validateAndAdjustShares returned null - check position balance`);
+        const adjusted = await this.validateAndAdjustShares(tokenId, shares, "[STOP-LOSS]");
+        if (!adjusted) {
+          throw new Error("[STOP-LOSS] Could not validate sell shares");
         }
 
-        // Use WebSocket bid override if provided and valid; otherwise fall back to REST
-        let validBid: number;
+        const rules = await this.fetchTokenMarketRules(tokenId);
+        const orderType = attempt === 1 ? OrderType.FOK : OrderType.FAK;
+
+        let priceCap: number | undefined;
         if (Number.isFinite(bidOverride ?? NaN) && (bidOverride as number) > 0) {
-          validBid = bidOverride as number;
-          if (validBid < 0.05) {
-            const errMsg = `[STOP-LOSS] Bid override too low: $${validBid.toFixed(4)} (min: 0.05)`;
-            this.lastMarketSellError = errMsg;
-            console.error(errMsg);
-            throw new Error(errMsg);
-          }
-        } else {
-          // Get current bid price for market sell (already rate limited)
-          const bidCheck = await this.checkBidValid(tokenId);
-
-          if (!bidCheck.valid) {
-            let errMsg: string;
-            if (bidCheck.reason === "empty_book") {
-              errMsg = `[STOP-LOSS] Order book empty (bid=0) - market may have resolved or no liquidity`;
-            } else {
-              errMsg = `[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.05) - likely bad data or resolved market`;
-            }
-            this.lastMarketSellError = errMsg;
-            console.error(errMsg);
-            // Don't retry if market is likely resolved - throw to trigger redemption flow
-            throw new Error(errMsg);
-          }
-
-          validBid = bidCheck.bid;
-        }
-        if (validBid > 0.99) {
-          // Cap at 0.99 (max allowed)
-          console.log(`[STOP-LOSS] Capping bid from $${validBid.toFixed(2)} to $0.99`);
-          validBid = 0.99;
+          priceCap = this.clampPriceToTick(bidOverride as number, rules.tickSize);
         }
 
         await clobLimiter.acquire();
-        const response = await client.createAndPostOrder({
-          tokenID: tokenId,
-          price: validBid,
-          size: sharesToSell,
-          side: Side.SELL,
-          feeRateBps: ORDER_FEE_RATE_BPS
-        });
+        const response = await client.createAndPostMarketOrder(
+          {
+            tokenID: tokenId,
+            amount: adjusted.sharesToSell,
+            side: Side.SELL,
+            ...(priceCap ? { price: priceCap } : {}),
+            orderType
+          },
+          undefined,
+          orderType
+        );
 
-        if (response.success) {
-          const orderId = response.orderID || "";
-
-          // Get actual fill price instead of placement price.
-          // If the order is not fully filled quickly, cancel remainder and retry later.
-          const fillInfo = await this.waitForFill(orderId, 3000);
-          const initialFilledShares = fillInfo?.filledShares || 0;
-          const fullyFilled = initialFilledShares >= sharesToSell * 0.99;
-
-          if (!fullyFilled) {
-            // One extra check in case order status API lagged during waitForFill.
-            const finalInfo = await this.getOrderFillInfo(orderId);
-            const finalFilledShares = finalInfo?.filledShares || initialFilledShares;
-            const finalFullyFilled = finalFilledShares >= sharesToSell * 0.99;
-
-            if (finalFullyFilled) {
-              const actualPrice = finalInfo?.avgPrice || fillInfo?.avgPrice || validBid;
-              return {
-                orderId,
-                price: actualPrice
-              };
-            }
-
-            const cancelled = await this.cancelOrder(orderId);
-
-            // If status/fill API lagged, confirm via position balance before declaring failure.
-            const remainingBalance = await this.getPositionBalance(tokenId);
-            if (remainingBalance !== null && remainingBalance < 0.01) {
-              const actualPrice = finalInfo?.avgPrice || fillInfo?.avgPrice || validBid;
-              console.log("[STOP-LOSS] Sell appears fully filled after timeout (position balance is zero)");
-              return {
-                orderId,
-                price: actualPrice
-              };
-            }
-
-            const inferredFilledShares = remainingBalance !== null
-              ? Math.max(0, sharesToSell - remainingBalance)
-              : finalFilledShares;
-            const fillDetail = inferredFilledShares > 0
-              ? `partially filled (${inferredFilledShares.toFixed(2)}/${sharesToSell.toFixed(2)})`
-              : "not filled";
-            const errMsg = cancelled
-              ? `[STOP-LOSS] Sell ${fillDetail} within timeout - cancelled remainder and will retry`
-              : `[STOP-LOSS] Sell ${fillDetail} within timeout - cancel may have failed`;
-            this.lastMarketSellError = errMsg;
-            console.log(errMsg);
-            return null;
+        if (!response.success) {
+          if (this.isBalanceAllowanceError(response.errorMsg || "")) {
+            const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 2000);
+            console.log(`[STOP-LOSS] Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            continue;
           }
 
-          const actualPrice = fillInfo?.avgPrice || validBid;
-
-          return {
-            orderId,
-            price: actualPrice
-          };
+          const errMsg = `[STOP-LOSS] Sell failed: ${response.errorMsg || "unknown error"}`;
+          this.lastMarketSellError = errMsg;
+          if (attempt < maxRetries) continue;
+          return null;
         }
 
-        if (this.isBalanceAllowanceError(response.errorMsg || "")) {
-          // Exponential backoff: 1s, 2s, 4s
-          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
-          console.log(`[STOP-LOSS] Sell failed due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
+        const orderId = response.orderID || "";
+        const fillInfo = await this.waitForFill(orderId, FAST_FILL_TIMEOUT_MS, 150);
+
+        if (!fillInfo || fillInfo.filledShares <= 0) {
+          const errMsg = `[STOP-LOSS] Market order had no fills (${orderType})`;
+          this.lastMarketSellError = errMsg;
+          if (attempt < maxRetries) continue;
+          return null;
+        }
+
+        const soldShares = Math.min(adjusted.sharesToSell, fillInfo.filledShares);
+        const fullyFilled = soldShares >= adjusted.sharesToSell * 0.99;
+
+        if (!fullyFilled && orderType === OrderType.FOK && attempt < maxRetries) {
           continue;
         }
 
-        const errMsg = `[STOP-LOSS] Sell failed: ${response.errorMsg || "unknown error"}`;
-        this.lastMarketSellError = errMsg;
-        console.error(errMsg);
-        throw new Error(errMsg);
+        const execPrice = fillInfo.avgPrice > 0
+          ? fillInfo.avgPrice
+          : (priceCap ?? bidOverride ?? 0);
+
+        return {
+          orderId,
+          price: execPrice,
+          soldShares,
+          fullyFilled
+        };
       } catch (err: any) {
         if (this.isBalanceAllowanceError(err?.toString() || "")) {
-          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
-          console.log(`[STOP-LOSS] Sell error due to balance/allowance (attempt ${attempt}/${maxRetries}), retrying in ${backoffMs}ms...`);
+          const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 2000);
           await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
+
         const errMsg = err instanceof Error ? err.message : String(err);
         this.lastMarketSellError = errMsg;
-        console.error("[STOP-LOSS] Sell error:", err);
+        if (attempt < maxRetries) continue;
         return null;
       }
     }
 
-    const errMsg = "[STOP-LOSS] Market sell failed after all retries - CRITICAL";
+    const errMsg = "[STOP-LOSS] Market sell failed after retries";
     this.lastMarketSellError = errMsg;
-    console.error(errMsg);
-    throw new Error(errMsg);
+    return null;
   }
 
   async getOpenOrders(): Promise<any[]> {
@@ -563,10 +575,9 @@ export class Trader {
     const order = await this.getOrder(orderId);
     if (!order) return false;
 
-    // Order is filled if status is 'MATCHED' or if size_matched equals original_size
     return order.status === "MATCHED" ||
-           (order.size_matched && order.original_size &&
-            parseFloat(order.size_matched) >= parseFloat(order.original_size));
+      (order.size_matched && order.original_size &&
+        parseFloat(order.size_matched) >= parseFloat(order.original_size));
   }
 
   /**
@@ -581,7 +592,6 @@ export class Trader {
     const originalSize = parseFloat(order.original_size || "0");
     const filled = order.status === "MATCHED" || (filledShares >= originalSize && originalSize > 0);
 
-    // Calculate average fill price from the order
     const avgPrice = parseFloat(order.price || "0");
     const status = (order.status || "").toUpperCase();
 
@@ -590,35 +600,35 @@ export class Trader {
 
   /**
    * Wait for an order to fill with timeout
-   * Returns fill info or null if timeout/cancelled
+   * Returns fill info (including partial fills) or null
    */
   async waitForFill(orderId: string, timeoutMs: number = 10000, pollIntervalMs: number = 500): Promise<{ filledShares: number; avgPrice: number } | null> {
     const startTime = Date.now();
     let consecutiveApiErrors = 0;
-    const maxConsecutiveApiErrors = 5; // Allow temporary API failures
+    const maxConsecutiveApiErrors = 5;
 
     while (Date.now() - startTime < timeoutMs) {
       const fillInfo = await this.getOrderFillInfo(orderId);
 
       if (!fillInfo) {
-        // API error or order not found yet - wait and retry (don't give up immediately)
         consecutiveApiErrors++;
         if (consecutiveApiErrors >= maxConsecutiveApiErrors) {
-          console.log(`[waitForFill] ${maxConsecutiveApiErrors} consecutive API errors - giving up`);
           return null;
         }
         await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
         continue;
       }
 
-      // Reset error counter on successful API call
       consecutiveApiErrors = 0;
 
       if (fillInfo.filled && fillInfo.filledShares > 0) {
         return { filledShares: fillInfo.filledShares, avgPrice: fillInfo.avgPrice };
       }
 
-      // Check if order was explicitly cancelled or rejected
+      if ((fillInfo.status === "CANCELLED" || fillInfo.status === "REJECTED") && fillInfo.filledShares > 0) {
+        return { filledShares: fillInfo.filledShares, avgPrice: fillInfo.avgPrice };
+      }
+
       if (fillInfo.status === "CANCELLED" || fillInfo.status === "REJECTED") {
         return null;
       }
@@ -626,7 +636,6 @@ export class Trader {
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
 
-    // Timeout - check final state and return partial fill if any
     const finalInfo = await this.getOrderFillInfo(orderId);
     if (finalInfo && finalInfo.filledShares > 0) {
       return { filledShares: finalInfo.filledShares, avgPrice: finalInfo.avgPrice };
@@ -646,22 +655,50 @@ export class Trader {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
 
-        // Check if order is already cancelled/filled (not an error)
         if (errMsg.includes("not found") || errMsg.includes("already") || errMsg.includes("cancelled")) {
-          console.log(`[Trader] Order ${orderId.slice(0, 8)}... already cancelled/filled`);
           return true;
         }
 
-        console.error(`[Trader] cancelOrder attempt ${attempt}/${maxRetries} failed: ${errMsg}`);
-
         if (attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // Backoff
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
         }
       }
     }
 
-    console.error(`[Trader] cancelOrder FAILED after ${maxRetries} attempts: ${orderId.slice(0, 8)}...`);
     return false;
+  }
+
+  async cancelOrdersForToken(tokenId: string): Promise<boolean> {
+    const client = this.ensureClient();
+    try {
+      await clobLimiter.acquire();
+      await client.cancelMarketOrders({ asset_id: tokenId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async cancelOrdersForMarket(marketId: string): Promise<boolean> {
+    const client = this.ensureClient();
+    try {
+      await clobLimiter.acquire();
+      await client.cancelMarketOrders({ market: marketId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async cancelAllOrders(): Promise<boolean> {
+    const client = this.ensureClient();
+    try {
+      await clobLimiter.acquire();
+      await client.cancelAll();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -669,29 +706,111 @@ export class Trader {
    */
   async verifyOrderCancelled(orderId: string): Promise<boolean> {
     const order = await this.getOrder(orderId);
-    if (!order) return true; // Not found = cancelled
+    if (!order) return true;
 
     const status = (order.status || "").toUpperCase();
     return status === "CANCELLED" || status === "MATCHED" || status === "REJECTED";
   }
 
   /**
-   * Check if bid price is valid for selling (not an empty book or resolved market)
+   * Check if bid price is valid for selling (not an empty book)
    */
   async checkBidValid(tokenId: string): Promise<{ valid: boolean; bid: number; reason?: string }> {
     const { bid } = await this.getPrice(tokenId);
 
-    // Empty order book (bid = 0) - could be resolved market or no liquidity
-    if (bid === 0) {
+    if (bid <= 0) {
       return { valid: false, bid, reason: "empty_book" };
     }
 
-    // Below minimum tradeable price - likely bad data or resolved market
-    if (bid < 0.05) {
-      return { valid: false, bid, reason: "below_minimum" };
+    return { valid: true, bid };
+  }
+
+  private canAutoRedeem(): boolean {
+    return this.signatureType === 0 && !this.funderAddress;
+  }
+
+  private getInventoryAddress(): string {
+    return this.funderAddress || this.signer.address;
+  }
+
+  async getRedeemableConditionIds(): Promise<string[]> {
+    try {
+      const user = this.getInventoryAddress();
+      const url = `${DATA_API}/positions?user=${user}&sizeThreshold=0&redeemable=true&limit=500`;
+      const res = await fetch(url);
+      if (!res.ok) return [];
+
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+
+      const conditionIds = new Set<string>();
+      for (const row of rows as RedeemablePositionRow[]) {
+        const raw = row.conditionId || row.condition_id;
+        if (typeof raw !== "string" || !raw.startsWith("0x") || raw.length !== 66) continue;
+
+        const redeemable = row.redeemable;
+        const isRedeemable = redeemable === true || redeemable === "true" || redeemable === undefined;
+        if (!isRedeemable) continue;
+
+        conditionIds.add(raw);
+      }
+
+      return [...conditionIds];
+    } catch {
+      return [];
+    }
+  }
+
+  async redeemCondition(conditionId: string, indexSets: number[] = [1, 2]): Promise<string | null> {
+    if (!this.canAutoRedeem()) {
+      return null;
     }
 
-    return { valid: true, bid };
+    const contract = new Contract(CONDITIONAL_TOKENS_ADDRESS, REDEEM_POSITIONS_ABI, this.signer);
+    const tx = await contract.redeemPositions(
+      COLLATERAL_TOKEN_ADDRESS,
+      constants.HashZero,
+      conditionId,
+      indexSets
+    );
+    const receipt = await tx.wait();
+    return receipt.transactionHash;
+  }
+
+  async redeemAllRedeemablePositions(): Promise<RedeemResult> {
+    const result: RedeemResult = {
+      attempted: 0,
+      redeemed: 0,
+      txHashes: [],
+      errors: []
+    };
+
+    const conditionIds = await this.getRedeemableConditionIds();
+    result.attempted = conditionIds.length;
+
+    if (conditionIds.length === 0) {
+      return result;
+    }
+
+    if (!this.canAutoRedeem()) {
+      result.errors.push("Auto-redeem is only supported for signatureType=0 EOA wallets");
+      return result;
+    }
+
+    for (const conditionId of conditionIds) {
+      try {
+        const txHash = await this.redeemCondition(conditionId);
+        if (txHash) {
+          result.redeemed++;
+          result.txHashes.push(txHash);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        result.errors.push(`${conditionId}: ${message}`);
+      }
+    }
+
+    return result;
   }
 
   getAddress(): string {
